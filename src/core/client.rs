@@ -1,11 +1,12 @@
-use std::{io::Result as IoResult, sync::Arc};
+use std::{io::{Result as IoResult, Cursor}, sync::Arc};
+use async_compression::tokio::write::{ZstdDecoder, ZstdEncoder};
 use chrono::{DateTime, TimeZone, Utc};
 use integer_hasher::IntMap;
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::FromPrimitive;
 use serde_json::{Number, Value};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpStream}, runtime::{Builder, Runtime}, sync::Mutex, task::JoinHandle};
-use super::buffer::Buffer;
+use super::{buffer::Buffer, types::Variable};
 use tracing::info;
 
 type TStreamReader = Arc<Mutex<StreamReader>>;
@@ -33,14 +34,14 @@ type ScriptRegister = dyn FnMut(RegistrationCode)
                         + Sync + Send;
 type ScriptLogin = dyn FnMut(LoginCode, Option<DateTime<Utc>>, Option<String>)
                         + Sync + Send;
-type ScriptP2p = dyn FnMut(i16, u64, Vec<Value>)
+type ScriptP2P = dyn FnMut(i16, u64, Vec<Variable>)
                         + Sync + Send;
 
 #[derive(Default)]
 pub struct StreamData {
     script_register: Option<Box<ScriptRegister>>,
     script_login: Option<Box<ScriptLogin>>,
-    script_p2p: Option<Box<ScriptP2p>>,
+    script_p2p: Option<Box<ScriptP2P>>,
     is_loggedin: bool,
     players: IntMap<u64, Player>,
     player_id: Option<u64>,
@@ -133,32 +134,66 @@ pub enum LoginCode {
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(i64)]
-pub enum P2pCode {
+pub enum P2PCode {
     AllGame = -5,
     CurrentSession = -6,
     CurrentRoom = -7,
     PlayerId(u64) = -8,
 }
-
-macro_rules! xor {
-    ($bytes: expr) => {{
-        let mut key = [0x76, 0xf2, 0xab, 0x8b];
-        let mut i = 0;
-        let len = $bytes.len();
-        $bytes.iter_mut().take(len.min(2048)).for_each(|x| {
-            let y = key[i];
-            *x ^= y;
-            key[i] = key[i].wrapping_add(y).wrapping_add(0xf9 ^ (i as u8));
-            i = (i + 1) % 4;
-        });
-    }};
-}
-
 macro_rules! prepare_buffer {
     ($data: expr) => {{
-        xor!($data.data);
-        for byte in ($data.data.len() as u32).to_be_bytes() {
-            $data.data.insert(0, byte);
+        let s_og = $data.size().unwrap();
+
+        let mut enc = ZstdEncoder::new(Vec::new());
+        enc.write_all($data.container.get_ref()).await.unwrap();
+        enc.shutdown().await.unwrap();
+        let enc = enc.into_inner();
+        let enc_s = enc.len() as u64;
+        let mut compr = false;
+        if enc_s + ((2 as u64).pow(
+            if enc_s <= u8::MAX as u64 {
+                0
+            } else if enc_s <= u16::MAX as u64 {
+                1
+            } else if enc_s <= u32::MAX as u64 {
+                2
+            } else {
+                3
+            }
+        )) < s_og {
+            $data.container = Cursor::new(enc);
+            compr = true;
+        }
+
+        let s = $data.size().unwrap();
+
+        $data.container.get_mut().insert(0,
+            if s <= u8::MAX as u64 {
+                0
+            } else if s <= u16::MAX as u64 {
+                1
+            } else if s <= u32::MAX as u64 {
+                2
+            } else {
+                3
+            } | ((compr as u8) << 7)
+        );
+        if s <= u8::MAX as u64 {
+            for byte in (s as u8).to_be_bytes() {
+                $data.container.get_mut().insert(1, byte);
+            }
+        } else if s <= u16::MAX as u64 {
+            for byte in (s as u16).to_be_bytes() {
+                $data.container.get_mut().insert(1, byte);
+            }
+        } else if s <= u32::MAX as u64 {
+            for byte in (s as u32).to_be_bytes() {
+                $data.container.get_mut().insert(1, byte);
+            }
+        } else {
+            for byte in s.to_be_bytes() {
+                $data.container.get_mut().insert(1, byte);
+            }
         }
     }};
 }
@@ -189,26 +224,89 @@ impl StreamHandler {
 }
 
 impl StreamReader {
-    pub async fn read(&mut self, xor: bool) -> Result<Buffer, ReaderError> {
+    pub async fn read(&mut self) -> Result<Buffer, ReaderError> {
         if let Some(stream) = self.stream.as_mut() {
             unwrap_return!(stream.readable().await, Err(ReaderError::StreamError));
-            let mut buf_size = [0u8; 4];
-            unwrap_return!(
-                stream.read_exact(&mut buf_size).await,
-                Err(ReaderError::StreamError)
-            );
-            let size = u32::from_le_bytes(buf_size);
-            info!("Packet Size: {size}");
+            let mut size = 0u64;
+            let is_compr;
+            if let Ok(n) = stream.read_u8().await {
+                is_compr = (n & 0x80) != 0;
+                match n & 0x7f {
+                    0 => {
+                        if let Ok(s) = stream.read_u8().await {
+                            size = s as u64;
+                        } else {
+                            return Err(ReaderError::StreamError);
+                        }
+                    }
+                    1 => {
+                        if let Ok(s) = stream.read_u16().await {
+                            size = s as u64;
+                        } else {
+                            return Err(ReaderError::StreamError);
+                        }
+                    }
+                    2 => {
+                        if let Ok(s) = stream.read_u32().await {
+                            size = s as u64;
+                        } else {
+                            return Err(ReaderError::StreamError);
+                        }
+                    }
+                    3 => {
+                        if let Ok(s) = stream.read_u64().await {
+                            size = s;
+                        } else {
+                            return Err(ReaderError::StreamError);
+                        }
+                    }
+                    _ => {}
+                }
+                if let Ok(n) = stream.read_u8().await {
+                    match n {
+                        0 => {
+                            if stream.read_u8().await.is_err() {
+                                return Err(ReaderError::StreamError);
+                            }
+                        }
+                        1 => {
+                            if stream.read_u16().await.is_err() {
+                                return Err(ReaderError::StreamError);
+                            }
+                        }
+                        2 => {
+                            if stream.read_u32().await.is_err() {
+                                return Err(ReaderError::StreamError);
+                            }
+                        }
+                        3 => {
+                            if stream.read_u64().await.is_err() {
+                                return Err(ReaderError::StreamError);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    return Err(ReaderError::StreamError);
+                }
+            } else {
+                return Err(ReaderError::StreamError);
+            }
+            //info!("size: {}, compr: {}", size, is_compr);
             if size > 0 {
                 let mut buf = vec![0; size as usize];
                 unwrap_return!(
                     stream.read_exact(&mut buf).await,
                     Err(ReaderError::StreamError)
                 );
-                if xor {
-                    xor!(buf);
+                if is_compr {
+                    let mut dec = ZstdDecoder::new(Vec::new());
+                    unwrap_return!(dec.write_all(&buf).await, Err(ReaderError::StreamError));
+                    unwrap_return!(dec.shutdown().await, Err(ReaderError::StreamError));
+                    Ok(Buffer::new(dec.into_inner()))
+                } else {
+                    Ok(Buffer::new(buf))
                 }
-                Ok(Buffer::new_with_data(buf).await)
             } else {
                 Err(ReaderError::StreamEmpty)
             }
@@ -222,9 +320,10 @@ impl StreamWriter {
     pub async fn write(&mut self, data: impl Into<Buffer>) -> Result<(), WriterError> {
         if let Some(stream) = self.stream.as_mut() {
             let mut data = data.into();
-            unwrap_return!(stream.writable().await, Err(WriterError::StreamError));
             prepare_buffer!(data);
-            unwrap_return!(stream.write_all(&data.data).await, Err(WriterError::StreamError));
+            unwrap_return!(stream.writable().await, Err(WriterError::StreamError));
+            unwrap_return!(stream.write_all(data.container.get_ref()).await, Err(WriterError::StreamError));
+            unwrap_return!(stream.flush().await, Err(WriterError::StreamError));
             Ok(())
 
         } else {
@@ -263,13 +362,13 @@ impl CrystalServer {
 
     async fn stream_handler(reader: TStreamReader, writer: TStreamWriter, tdata: TStreamData) -> IoResult<()> {
         loop {
-            match reader.lock().await.read(true).await {
+            match reader.lock().await.read().await {
                 Ok(mut data) => {
                     let read_result: IoResult<()> = {
-                        match data.read::<u8>().await? {
+                        match data.read_u8()? {
                             0 => {
                                 // Registration
-                                let code = RegistrationCode::from_u8(data.read::<u8>().await?).unwrap();
+                                let code = RegistrationCode::from_u8(data.read_u8()?).unwrap();
                                 let mut lock = tdata.lock().await;
                                 if let Some(sr) = lock.script_register.as_mut() {
                                     sr(code);
@@ -277,18 +376,18 @@ impl CrystalServer {
                             }
                             1 => {
                                 // Login
-                                let code = LoginCode::from_u8(data.read::<u8>().await?).unwrap();
+                                let code = LoginCode::from_u8(data.read_u8()?).unwrap();
                                 let mut lock = tdata.lock().await;
                                 match code {
                                     LoginCode::OK => {
                                         lock.is_loggedin = true;
-                                        lock.player_id = Some(data.read::<u64>().await?);
-                                        lock.player_name = Some(data.read::<String>().await?);
-                                        lock.player_save = serde_json::from_str(&data.read::<String>().await?)?;
+                                        lock.player_id = Some(data.read_u64()?);
+                                        lock.player_name = Some(data.read::<String>()?);
+                                        lock.player_save = serde_json::from_str(&data.read::<String>()?)?;
                                     }
                                     LoginCode::GameBan => {
-                                        let unban_time = data.read::<u64>().await?;
-                                        let reason = data.read::<String>().await?;
+                                        let unban_time = data.read_u64()?;
+                                        let reason = data.read::<String>()?;
                                         if let Some(sl) = lock.script_login.as_mut() {
                                             sl(code, Some(Utc.timestamp_opt(unban_time as i64, 0).unwrap().to_utc()), Some(reason));
                                         }
@@ -307,10 +406,10 @@ impl CrystalServer {
                                 let mut player = Player {
                                     ..Default::default()
                                 };
-                                player.id = data.read::<u64>().await?;
-                                player.name = data.read::<String>().await?;
-                                player.variables = serde_json::from_str(&data.read::<String>().await?)?;
-                                let instances: Value = serde_json::from_str(&data.read::<String>().await?)?;
+                                player.id = data.read_u64()?;
+                                player.name = data.read::<String>()?;
+                                player.variables = serde_json::from_str(&data.read::<String>()?)?;
+                                let instances: Value = serde_json::from_str(&data.read::<String>()?)?;
                                 for instance in instances.as_array().unwrap() {
                                     let mut inst = Instance {
                                         ..Default::default()
@@ -321,57 +420,31 @@ impl CrystalServer {
                                     inst.local_variables = serde_json::from_str(instance["local_variables"].as_str().unwrap_or_default())?;
                                     player.instances.push(inst);
                                 }
-                                player.room = data.read::<String>().await?;
+                                player.room = data.read::<String>()?;
                                 lock.players.insert(player.id, player);
                             }
                             3 => {
                                 // User logged out
                                 let mut lock = tdata.lock().await;
-                                lock.players.remove(&data.read::<u64>().await?);
+                                lock.players.remove(&data.read_u64()?);
                             }
                             4 => {
                                 // Sync game info
                                 let mut lock = tdata.lock().await;
-                                lock.game_save = serde_json::from_str(&data.read::<String>().await?)?;
-                                lock.game_achievements = serde_json::from_str(&data.read::<String>().await?)?;
-                                lock.game_highscores = serde_json::from_str(&data.read::<String>().await?)?;
-                                lock.game_administrators = serde_json::from_str(&data.read::<String>().await?)?;
-                                lock.game_version = data.read::<f64>().await?;
+                                lock.game_save = serde_json::from_str(&data.read::<String>()?)?;
+                                lock.game_achievements = serde_json::from_str(&data.read::<String>()?)?;
+                                lock.game_highscores = serde_json::from_str(&data.read::<String>()?)?;
+                                lock.game_administrators = serde_json::from_str(&data.read::<String>()?)?;
+                                lock.game_version = data.read::<f64>()?;
                             }
                             5 => {
-                                // P2p
-                                let player_id = data.read::<u64>().await?;
-                                let message_id = data.read::<i16>().await?;
-                                let size = match data.read::<u8>().await? {
-                                    1 => data.read::<u8>().await? as usize,
-                                    2 => data.read::<u16>().await? as usize,
-                                    3 => data.read::<u32>().await? as usize,
-                                    4 => data.read::<u64>().await? as usize,
-                                    _ => 0,
-                                };
-                                let mut p2p_data = Vec::with_capacity(size);
-                                for _ in 0..size {
-                                    match data.read::<u8>().await? {
-                                        0 => p2p_data.push(Value::String(data.read::<String>().await?)),
-                                        1 => p2p_data.push(Value::Number(Number::from_f64(data.read::<f64>().await?).unwrap_or(Number::from(0)))),
-                                        2 => p2p_data.push(Value::Number(Number::from(data.read::<i64>().await?))),
-                                        3 => p2p_data.push(Value::Null),
-                                        4 => p2p_data.push(Value::Bool(data.read::<bool>().await?)),
-                                        5 => p2p_data.push(data.read::<Value>().await?),
-                                        6 => p2p_data.push(Value::Array({
-                                            let tmp = data.read::<Vec<u8>>().await?;
-                                            let mut opt = Vec::new();
-                                            for val in tmp {
-                                                opt.push(Value::Number(Number::from(val)));
-                                            }
-                                            opt
-                                        })),
-                                        _ => {},
-                                    }
-                                }
+                                // P2P
+                                let player_id = data.read_u64()?;
+                                let message_id = data.read_i16()?;
+                                let data = data.read::<Vec<Variable>>()?;
                                 let mut lock = tdata.lock().await;
                                 if let Some(sp) = lock.script_p2p.as_mut() {
-                                    sp(message_id, player_id, p2p_data);
+                                    sp(message_id, player_id, data);
                                 }
                             }
                             _ => {}
@@ -391,23 +464,25 @@ impl CrystalServer {
         }
     }
 
-    pub async fn p2p(code: P2pCode, message_id: i16, data: Option<Vec<Value>>) {
-        let mut b = Buffer::new().await;
-        b.write::<u8>(4).await;
+    pub async fn p2p(code: P2PCode, message_id: i16, data: Option<Vec<Value>>) -> IoResult<()> {
+        let mut b = Buffer::empty();
+        b.write_u8(4)?;
         match code {
-            P2pCode::AllGame => {
-                b.write::<u8>(1).await;
+            P2PCode::AllGame => {
+                b.write_u8(1)?;
             }
-            P2pCode::CurrentSession => {
-                b.write::<u8>(2).await;
+            P2PCode::CurrentSession => {
+                b.write_u8(2)?;
             }
-            P2pCode::CurrentRoom => {
-                b.write::<u8>(3).await;
+            P2PCode::CurrentRoom => {
+                b.write_u8(3)?;
             }
-            P2pCode::PlayerId(player_id) => {
-                b.write::<u8>(0).await;
-                b.write::<u64>(player_id).await;
+            P2PCode::PlayerId(player_id) => {
+                b.write_u8(0)?;
+                b.write_u64(player_id)?;
             }
         }
+
+        Ok(())
     }
 }

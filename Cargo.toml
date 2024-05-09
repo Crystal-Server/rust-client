@@ -10,13 +10,15 @@ default = ["debug"]
 debug = ["dep:tracing", "dep:color-eyre", "dep:tracing-subscriber"]
 
 [dependencies]
-bstr = "1.9.0"
-chrono = "0.4.33"
+bstr = "1.9.1"
+chrono = "0.4.38"
 num-traits = "0.2"
 num-derive = "0.4"
-serde_json = "1.0.113"
+byteorder = "1.5.0"
+serde_json = "1.0.117"
 integer-hasher = "0.1.1"
-tokio = { version = "1.36", features = ["rt", "io-util", "io-std", "sync", "net", "full"] }
 tracing = { version = "0.1.40", optional = true }
-color-eyre = { version = "0.6.2", optional = true }
+color-eyre = { version = "0.6.3", optional = true }
 tracing-subscriber = { version = "0.3.18", optional = true }
+async-compression = { version = "0.4.9", features = ["tokio", "zstd"] }
+tokio = { version = "1.37", features = ["rt", "io-util", "io-std", "sync", "net", "full"] }
