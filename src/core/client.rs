@@ -520,11 +520,6 @@ impl CrystalServer {
         if let Ok((ws, _)) =
             tokio_tungstenite::connect_async("ws://server.crystal-server.co:16562").await
         {
-            {
-                let mut dlock = self.data.write().await;
-                dlock.is_connecting = false;
-                dlock.is_connected = true;
-            }
             let stream = StreamHandler::split_stream(ws).await;
             let writer = Arc::new(Mutex::new(stream.1));
             self.writer = Some(writer.clone());
@@ -566,6 +561,7 @@ impl CrystalServer {
                                         let encodepub_read = encode_read.to_public();
                                         reader.identity = Some(encode_read);
                                         if let Ok(key) = Recipient::from_str(&key) {
+                                            data.write().await.is_connecting = false;
                                             writer.lock().await.recipient = Some(key);
                                         } else {
                                             {
@@ -624,6 +620,7 @@ impl CrystalServer {
                                     dlock.game_administrators = game_administrators;
                                     dlock.game_version = game_version;
                                     dlock.handshake_completed = true;
+                                    dlock.is_connected = true;
                                 }
                                 ReadPacket::Ping(ping) => {
                                     if let Some(ping) = ping {
@@ -679,6 +676,7 @@ impl CrystalServer {
                                         IntSet::from_iter(incoming_friends.iter().map(|pid| **pid));
                                     dlock.player_outgoing_friends =
                                         IntSet::from_iter(outgoing_friends.iter().map(|pid| **pid));
+                                    dlock.is_loggedin = true;
                                     if let Some(log) = &mut dlock.func_login {
                                         log(LoginCode::Ok, None, None);
                                     }
@@ -1763,10 +1761,8 @@ impl CrystalServer {
 
     /// Checks if the client is trying to establish an active connection to the server.
     pub async fn is_connecting(&self) -> bool {
-        self.data.read().await.is_connecting && {
-            let dlock = self.data.read().await;
-            dlock.handshake_completed && self.thread.is_finished()
-        }
+        let dlock = self.data.read().await;
+        dlock.is_connecting || !dlock.handshake_completed
     }
 
     /// Check if the client is logged into the game.
