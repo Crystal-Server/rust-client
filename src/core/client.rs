@@ -1782,6 +1782,11 @@ impl CrystalServer {
         self.data.read().await.ping
     }
 
+    /// Sets the Game Token so that the player is able to log-in to the servers.
+    pub async fn set_game_token(&self, token: &str) {
+        self.data.write().await.game_token = token.to_owned();
+    }
+
     /// Disconnects the client from the server on an on-going active connection.
     pub async fn disconnect(&self) {
         self.thread.abort();
