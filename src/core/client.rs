@@ -501,10 +501,13 @@ enum WritePacket {
 }
 
 impl CrystalServer {
-    pub fn init() -> Self {
+    pub fn init(game_id: &str) -> Self {
         Self {
             writer: None,
-            data: Arc::new(RwLock::new(StreamData::default())),
+            data: Arc::new(RwLock::new(StreamData {
+                game_id: game_id.to_owned(),
+                ..Default::default()
+            })),
             thread: tokio::spawn(async {}),
         }
     }
@@ -2361,11 +2364,15 @@ impl CrystalServer {
 
         Box::pin(async_stream::stream! {
             for id in data.read().await.players.keys().cloned().collect::<Vec<u64>>() {
-                if let Some(player) = data.read().await.players.get(&id).cloned() {
-                    for (index, sync) in player.syncs.iter().cloned().enumerate() {
+                let player_data = data.read().await.players.get(&id).cloned();
+                if let Some(player) = player_data {
+                    let syncs_data = player.syncs.iter().cloned().enumerate();
+                    for (index, sync) in syncs_data {
                         if let Some(sync) = sync {
-                            if data.read().await.room != player.room && sync.event != SyncEvent::End {
-                                continue;
+                            {
+                                if data.read().await.room != player.room && sync.event != SyncEvent::End {
+                                    continue;
+                                }
                             }
                             let iter = SyncIter {
                                 player_id: id,
