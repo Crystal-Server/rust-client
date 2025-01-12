@@ -517,7 +517,9 @@ impl CrystalServer {
             self.thread.abort();
         }
         self.data.write().await.is_connecting = true;
-        if let Ok((ws, _)) = tokio_tungstenite::connect_async("ws://127.0.0.1:16562").await {
+        if let Ok((ws, _)) =
+            tokio_tungstenite::connect_async("ws://server.crystal-server.co:16562").await
+        {
             {
                 let mut dlock = self.data.write().await;
                 dlock.is_connecting = false;
