@@ -517,8 +517,12 @@ impl CrystalServer {
             self.thread.abort();
         }
         self.data.write().await.is_connecting = true;
-        if let Ok((ws, _)) =
-            tokio_tungstenite::connect_async("ws://server.crystal-server.co:16562").await
+        if let Ok((ws, _)) = tokio_tungstenite::connect_async(if cfg!(feature = "__local") {
+            "ws://localhost:16562"
+        } else {
+            "ws://server.crystal-server.co:16562"
+        })
+        .await
         {
             let stream = StreamHandler::split_stream(ws).await;
             let writer = Arc::new(Mutex::new(stream.1));
