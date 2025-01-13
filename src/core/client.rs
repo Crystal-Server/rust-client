@@ -66,7 +66,7 @@ type CallbackRoom = Box<dyn FnMut() -> String + Sync + Send>;
 type CallbackP2P = Box<dyn FnMut(u64, i16, Vec<Variable>) + Sync + Send>;
 type CallbackRegister = Box<dyn FnMut(RegistrationCode) + Sync + Send>;
 type CallbackLogin = Box<dyn FnMut(LoginCode, Option<DateTime<Utc>>, Option<String>) + Sync + Send>;
-type CallbackBanned = Box<dyn FnMut(DateTime<Utc>, String) + Sync + Send>;
+type CallbackBanned = Box<dyn FnMut(String, DateTime<Utc>) + Sync + Send>;
 type CallbackKicked = Box<dyn FnMut(String) + Sync + Send>;
 type CallbackDisconnected = Box<dyn FnMut() + Sync + Send>;
 type CallbackLoginToken = Box<dyn FnMut(String) + Sync + Send>;
@@ -992,15 +992,25 @@ impl CrystalServer {
                                         AdminAction::Ban(reason, unban_time) => {
                                             if let Some(callback) = &mut dlock.func_banned {
                                                 callback(
+                                                    reason.clone(),
                                                     DateTime::from_timestamp(unban_time, 0)
-                                                        .expect("unable to parse unban timestamp"),
-                                                    reason,
+                                                        .expect("unable to parse ban timestamp"),
                                                 );
+                                            }
+                                            if let Some(dup) = dlock.func_data_update.as_mut() {
+                                                dup(DataUpdate::Banned(
+                                                    reason,
+                                                    DateTime::from_timestamp(unban_time, 0)
+                                                        .expect("unable to parse ban timestamp"),
+                                                ));
                                             }
                                         }
                                         AdminAction::Kick(reason) => {
                                             if let Some(callback) = &mut dlock.func_kicked {
-                                                callback(reason);
+                                                callback(reason.clone());
+                                            }
+                                            if let Some(dup) = dlock.func_data_update.as_mut() {
+                                                dup(DataUpdate::Kicked(reason));
                                             }
                                         }
                                         AdminAction::Unban => {
@@ -1199,6 +1209,9 @@ impl CrystalServer {
                 if dlock.call_disconnected {
                     if let Some(func) = dlock.func_disconnected.as_mut() {
                         func();
+                    }
+                    if let Some(dup) = dlock.func_data_update.as_mut() {
+                        dup(DataUpdate::Disconnected());
                     }
                 }
             }
@@ -1568,6 +1581,9 @@ impl CrystalServer {
             if let Some(ping) = dlock.last_ping {
                 if ping.elapsed().as_secs_f64() >= 90.0 {
                     self.disconnect().await;
+                    if let Some(dup) = self.data.write().await.func_data_update.as_mut() {
+                        dup(DataUpdate::Disconnected());
+                    }
                 }
             }
             if let Some(room_callback) = &mut dlock.func_room {

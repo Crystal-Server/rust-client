@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use integer_hasher::IntMap;
 use num_enum::TryFromPrimitive;
 
@@ -162,6 +163,11 @@ pub enum DataUpdate {
     /// Message
     ServerMessage(String),
     Reconnecting(),
+    Disconnected(),
+    /// Reason
+    Kicked(String),
+    /// Reason, Unban Unix Time
+    Banned(String, DateTime<Utc>),
 }
 
 #[derive(Default, Copy, Clone, Debug, TryFromPrimitive, PartialEq, Eq, PartialOrd, Ord)]
