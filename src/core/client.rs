@@ -63,7 +63,7 @@ struct StreamWriter {
 }
 
 type CallbackRoom = Box<dyn FnMut() -> String + Sync + Send>;
-type CallbackP2P = Box<dyn FnMut(u64, i16, Vec<Variable>) + Sync + Send>;
+type CallbackP2P = Box<dyn FnMut(Option<u64>, i16, Vec<Variable>) + Sync + Send>;
 type CallbackRegister = Box<dyn FnMut(RegistrationCode) + Sync + Send>;
 type CallbackLogin = Box<dyn FnMut(LoginCode, Option<DateTime<Utc>>, Option<String>) + Sync + Send>;
 type CallbackBanned = Box<dyn FnMut(String, DateTime<Utc>) + Sync + Send>;
@@ -399,8 +399,8 @@ enum ReadPacket {
         IntMap<Leb<u64>, Administrator>,
         f64,
     ),
-    /// Player ID, Message ID, Data
-    P2P(u64, i16, Vec<Variable>),
+    /// Player ID or Server, Message ID, Data
+    P2P(Option<Leb<u64>>, i16, Vec<Variable>),
     /// Player ID, Variables
     UpdatePlayerVariable(u64, Vec<VariableUpdate>),
     /// Ping (ms)
@@ -733,10 +733,10 @@ impl CrystalServer {
                                 ReadPacket::P2P(pid, mid, payload) => {
                                     let mut dlock = data.write().await;
                                     if let Some(p2p) = &mut dlock.func_p2p {
-                                        p2p(pid, mid, payload.clone());
+                                        p2p(pid.map(|v| *v), mid, payload.clone());
                                     }
                                     if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::P2P(pid, mid, payload));
+                                        dup(DataUpdate::P2P(pid.map(|v| *v), mid, payload));
                                     }
                                 }
                                 ReadPacket::UpdatePlayerVariable(pid, upds) => {
@@ -1461,7 +1461,7 @@ impl CrystalServer {
                 ))
             }
             5 => {
-                let pid = b.read_leb_u64()?;
+                let pid = b.read()?;
                 let mid = b.read_i16()?;
                 let payload = b.read()?;
                 Ok(ReadPacket::P2P(pid, mid, payload))

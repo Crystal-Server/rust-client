@@ -138,8 +138,8 @@ pub enum DataUpdate {
     PlayerLoggedIn(u64, String, String),
     /// Player ID
     PlayerLoggedOut(u64),
-    /// Player ID, Message ID, Payload
-    P2P(u64, i16, Vec<Variable>),
+    /// Player ID or Server, Message ID, Payload
+    P2P(Option<u64>, i16, Vec<Variable>),
     /// Player ID, Variable Name, Variable Value
     UpdateVariable(u64, String, OptionalVariable),
     /// Player ID, Sync ID, Variable Name, Variable Value
