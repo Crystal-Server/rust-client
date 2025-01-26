@@ -223,6 +223,7 @@ pub enum PlayerRequest {
     AllGame,
     CurrentSession,
     CurrentRoom,
+    Server,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -451,6 +452,9 @@ impl Serialize for PlayerRequest {
             PlayerRequest::CurrentRoom => {
                 buffer.write_u8(3)?;
             }
+            PlayerRequest::Server => {
+                buffer.write_u8(4)?;
+            }
         }
 
         Ok(())
@@ -462,6 +466,7 @@ impl Serialize for PlayerRequest {
             1 => Ok(PlayerRequest::AllGame),
             2 => Ok(PlayerRequest::CurrentSession),
             3 => Ok(PlayerRequest::CurrentRoom),
+            4 => Ok(PlayerRequest::Server),
             _ => Err(Error::new(
                 ErrorKind::InvalidData,
                 "Invalid PlayerRequest handle",
