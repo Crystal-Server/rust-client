@@ -539,8 +539,14 @@ impl CrystalServer {
                 let mut lock = self.data.write().await;
                 lock.thread = Some(thread);
             }
-        } else if self.data.write().await.last_host.take().is_some() {
-            Box::pin(self.connect()).await;
+        } else {
+            let mut dlock = self.data.write().await;
+            if dlock.last_host.take().is_some() {
+                drop(dlock);
+                Box::pin(self.connect()).await;
+            } else {
+                dlock.is_connecting = false;
+            }
         }
     }
 
