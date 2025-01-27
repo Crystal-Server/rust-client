@@ -40,7 +40,7 @@ use tokio::{
 };
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 #[cfg(feature = "__dev")]
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct CrystalServer {
     writer: Option<Arc<Mutex<StreamWriter>>>,
@@ -563,6 +563,7 @@ impl CrystalServer {
     ) {
         let cdata = data.clone();
         let cwriter = writer.clone();
+
         let task = tokio::spawn(async move {
             macro_rules! write_packet {
                 ($packet: expr) => {
@@ -589,24 +590,30 @@ impl CrystalServer {
                                         let encode_read = Identity::generate();
                                         let encodepub_read = encode_read.to_public();
                                         reader.identity = Some(encode_read);
-                                        if let Ok(key) = Recipient::from_str(&key) {
-                                            {
-                                                let mut dlock = data.write().await;
-                                                dlock.is_connecting = false;
-                                                dlock.is_reconnecting = false;
+                                        match Recipient::from_str(&key) {
+                                            Ok(key) => {
+                                                {
+                                                    let mut dlock = data.write().await;
+                                                    dlock.is_connecting = false;
+                                                    dlock.is_reconnecting = false;
+                                                    dlock.is_connected = true;
+                                                }
+                                                writer.lock().await.recipient = Some(key);
                                             }
-                                            writer.lock().await.recipient = Some(key);
-                                        } else {
-                                            {
-                                                let mut dlock = data.write().await;
-                                                dlock.clear(true).await;
-                                                dlock.registered_errors.push(
-                                                    ClientError::HandlerResultString(String::from(
-                                                        "unable to set write key for data writer",
-                                                    )),
-                                                );
+                                            Err(_e) => {
+                                                #[cfg(feature = "__dev")]
+                                                warn!("error while parsing key: {_e:?}");
+                                                {
+                                                    let mut dlock = data.write().await;
+                                                    dlock.clear(true).await;
+                                                    dlock.registered_errors.push(
+                                                        ClientError::HandlerResultString(String::from(
+                                                            "unable to set write key for data writer",
+                                                        )),
+                                                    );
+                                                }
+                                                return Ok(());
                                             }
-                                            return Ok(());
                                         }
                                         write_packet!(WritePacket::Handshake(
                                             encodepub_read.to_string(),
@@ -653,7 +660,6 @@ impl CrystalServer {
                                     dlock.game_administrators = game_administrators;
                                     dlock.game_version = game_version;
                                     dlock.handshake_completed = true;
-                                    dlock.is_connected = true;
                                 }
                                 ReadPacket::Ping(ping) => {
                                     if let Some(ping) = ping {
@@ -1822,7 +1828,7 @@ impl CrystalServer {
         let dlock = self.data.read().await;
         dlock.is_connected && dlock.handshake_completed && {
             if let Some(thread) = &dlock.thread {
-                thread.is_finished()
+                !thread.is_finished()
             } else {
                 true
             }
@@ -1832,7 +1838,7 @@ impl CrystalServer {
     /// Checks if the client is trying to establish an active connection to the server.
     pub async fn is_connecting(&self) -> bool {
         let dlock = self.data.read().await;
-        dlock.is_connecting || !dlock.handshake_completed
+        dlock.is_connecting || (!dlock.handshake_completed && dlock.is_connected)
     }
 
     /// Check if the client is logged into the game.
