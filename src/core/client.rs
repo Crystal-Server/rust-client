@@ -45,7 +45,6 @@ use tracing::info;
 pub struct CrystalServer {
     writer: Option<Arc<Mutex<StreamWriter>>>,
     data: Arc<RwLock<StreamData>>,
-    thread: JoinHandle<()>,
 }
 
 struct StreamHandler;
@@ -75,6 +74,9 @@ type CallbackBDB = Box<dyn FnMut(String, Option<Vec<u8>>) + Sync + Send>;
 
 #[derive(Default)]
 pub struct StreamData {
+    thread: Option<JoinHandle<()>>,
+    last_host: Option<String>,
+
     is_connected: bool,
     is_loggedin: bool,
     is_connecting: bool,
@@ -440,9 +442,9 @@ enum ReadPacket {
     /// Key
     Handshake(Option<String>),
     /// Message
-    ServerMessage(String), // TODO: Finish this
+    ServerMessage(String),
     /// Target Host
-    ChangeConnection(String), // TODO: Finish this
+    ChangeConnection(String),
 }
 
 #[derive(Debug, Clone)]
@@ -508,26 +510,38 @@ impl CrystalServer {
                 game_id: game_id.to_owned(),
                 ..Default::default()
             })),
-            thread: tokio::spawn(async {}),
         }
     }
 
     pub async fn connect(&mut self) {
-        if !self.thread.is_finished() {
-            self.thread.abort();
-        }
-        self.data.write().await.is_connecting = true;
-        if let Ok((ws, _)) = tokio_tungstenite::connect_async(if cfg!(feature = "__local") {
-            "ws://localhost:16562"
-        } else {
-            "ws://server.crystal-server.co:16562"
-        })
-        .await
         {
+            let mut lock = self.data.write().await;
+            if let Some(thread) = &mut lock.thread {
+                if !thread.is_finished() {
+                    thread.abort();
+                }
+            }
+            lock.is_connecting = true;
+        }
+        let url = if let Some(url) = self.data.read().await.last_host.clone() {
+            url
+        } else if cfg!(feature = "__local") {
+            String::from("ws://localhost:16562")
+        } else {
+            String::from("ws://server.crystal-server.co:16562")
+        };
+        if let Ok((ws, _)) = tokio_tungstenite::connect_async(url).await {
             let stream = StreamHandler::split_stream(ws).await;
             let writer = Arc::new(Mutex::new(stream.1));
             self.writer = Some(writer.clone());
-            self.thread = tokio::spawn(Self::stream_handler(stream.0, writer, self.data.clone()));
+            let thread = tokio::spawn(Self::stream_handler(stream.0, writer, self.data.clone()));
+            {
+                let mut lock = self.data.write().await;
+                lock.thread = Some(thread);
+            }
+        } else {
+            self.data.write().await.last_host.take();
+            Box::pin(self.connect()).await;
         }
     }
 
@@ -565,7 +579,11 @@ impl CrystalServer {
                                         let encodepub_read = encode_read.to_public();
                                         reader.identity = Some(encode_read);
                                         if let Ok(key) = Recipient::from_str(&key) {
-                                            data.write().await.is_connecting = false;
+                                            {
+                                                let mut dlock = data.write().await;
+                                                dlock.is_connecting = false;
+                                                dlock.is_reconnecting = false;
+                                            }
                                             writer.lock().await.recipient = Some(key);
                                         } else {
                                             {
@@ -1186,10 +1204,25 @@ impl CrystalServer {
                                         dup(DataUpdate::ServerMessage(msg.clone()));
                                     }
                                 }
-                                ReadPacket::ChangeConnection(_host) => {
+                                ReadPacket::ChangeConnection(host) => {
                                     let mut dlock = data.write().await;
+                                    dlock.is_connecting = true;
+                                    dlock.is_reconnecting = true;
                                     if let Some(dup) = &mut dlock.func_data_update {
                                         dup(DataUpdate::Reconnecting());
+                                    }
+                                    if let Ok((ws, _)) =
+                                        tokio_tungstenite::connect_async(&host).await
+                                    {
+                                        let (sread, swrite) = StreamHandler::split_stream(ws).await;
+                                        *writer.lock().await = swrite;
+                                        reader = sread;
+                                        dlock.last_host = Some(host);
+                                    } else {
+                                        return Err(Error::new(
+                                            ErrorKind::ConnectionRefused,
+                                            "unable to connect to new host",
+                                        ));
                                     }
                                 }
                             }
@@ -1776,7 +1809,13 @@ impl CrystalServer {
     /// Checks if the client has an active connection to the server.
     pub async fn is_connected(&self) -> bool {
         let dlock = self.data.read().await;
-        dlock.is_connected && dlock.handshake_completed && !self.thread.is_finished()
+        dlock.is_connected && dlock.handshake_completed && {
+            if let Some(thread) = &dlock.thread {
+                thread.is_finished()
+            } else {
+                true
+            }
+        }
     }
 
     /// Checks if the client is trying to establish an active connection to the server.
@@ -1805,8 +1844,11 @@ impl CrystalServer {
 
     /// Disconnects the client from the server on an on-going active connection.
     pub async fn disconnect(&self) {
-        self.thread.abort();
-        self.data.write().await.clear(true).await;
+        let mut lock = self.data.write().await;
+        if let Some(thread) = lock.thread.take() {
+            thread.abort();
+        }
+        lock.clear(true).await;
     }
 
     async fn internal_iosend(&self, data: Buffer) -> IoResult<()> {

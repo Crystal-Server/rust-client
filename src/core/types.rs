@@ -168,6 +168,8 @@ pub enum DataUpdate {
     Kicked(String),
     /// Reason, Unban Unix Time
     Banned(String, DateTime<Utc>),
+    /// Notification Message
+    ServerNotification(String),
 }
 
 #[derive(Default, Copy, Clone, Debug, TryFromPrimitive, PartialEq, Eq, PartialOrd, Ord)]
