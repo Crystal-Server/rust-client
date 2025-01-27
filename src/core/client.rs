@@ -530,22 +530,28 @@ impl CrystalServer {
         } else {
             String::from("ws://server.crystal-server.co:16562")
         };
-        if let Ok((ws, _)) = tokio_tungstenite::connect_async(url).await {
-            let stream = StreamHandler::split_stream(ws).await;
-            let writer = Arc::new(Mutex::new(stream.1));
-            self.writer = Some(writer.clone());
-            let thread = tokio::spawn(Self::stream_handler(stream.0, writer, self.data.clone()));
-            {
-                let mut lock = self.data.write().await;
-                lock.thread = Some(thread);
+        match tokio_tungstenite::connect_async(url).await {
+            Ok((ws, _)) => {
+                let stream = StreamHandler::split_stream(ws).await;
+                let writer = Arc::new(Mutex::new(stream.1));
+                self.writer = Some(writer.clone());
+                let thread =
+                    tokio::spawn(Self::stream_handler(stream.0, writer, self.data.clone()));
+                {
+                    let mut lock = self.data.write().await;
+                    lock.thread = Some(thread);
+                }
             }
-        } else {
-            let mut dlock = self.data.write().await;
-            if dlock.last_host.take().is_some() {
-                drop(dlock);
-                Box::pin(self.connect()).await;
-            } else {
-                dlock.is_connecting = false;
+            Err(_e) => {
+                #[cfg(feature = "__dev")]
+                info!("Connection error: {_e:?}");
+                let mut dlock = self.data.write().await;
+                if dlock.last_host.take().is_some() {
+                    drop(dlock);
+                    Box::pin(self.connect()).await;
+                } else {
+                    dlock.is_connecting = false;
+                }
             }
         }
     }
