@@ -1774,6 +1774,7 @@ impl CrystalServer {
             if dlock.is_loggedin {
                 dlock.is_loggedin = false;
             }
+            dlock.last_ping.take();
         }
         Ok(())
     }
