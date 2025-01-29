@@ -19,7 +19,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::{
     stream::{SplitSink, SplitStream},
-    AsyncReadExt, AsyncWriteExt, SinkExt, StreamExt,
+    AsyncReadExt, AsyncWriteExt, SinkExt, Stream, StreamExt,
 };
 use integer_hasher::{IntMap, IntSet};
 use machineid_rs::{Encryption, HWIDComponent, IdBuilder};
@@ -28,7 +28,6 @@ use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Error, ErrorKind, Result as IoResult},
     iter,
-    pin::Pin,
     str::FromStr,
     sync::Arc,
 };
@@ -1969,17 +1968,15 @@ impl CrystalServer {
     }
 
     /// Stream to fetch all current player (excluding this client) data.
-    pub async fn iter_other_players(
-        &self,
-    ) -> Pin<Box<dyn futures_util::Stream<Item = (u64, Player)> + Sync + Send>> {
+    pub async fn iter_other_players(&self) -> impl Stream<Item = (u64, Player)> {
         let data = self.data.clone();
-        Box::pin(async_stream::stream! {
+        async_stream::stream! {
             for id in data.read().await.players.keys().cloned().collect::<Vec<u64>>() {
                 if let Some(player) = data.read().await.players.get(&id).cloned() {
                     yield (id, player);
                 }
             }
-        })
+        }
     }
 
     /// Gets the current amount of players. (excluding this client.)
@@ -2440,9 +2437,7 @@ impl CrystalServer {
     }
 
     /// Stream to fetch all current syncs from players (excluding this client) data.
-    pub async fn iter_other_syncs(
-        &self,
-    ) -> Pin<Box<dyn futures_util::Stream<Item = SyncIter> + Sync + Send>> {
+    pub async fn iter_other_syncs(&self) -> impl Stream<Item = SyncIter> {
         let data = self.data.clone();
 
         Box::pin(async_stream::stream! {
