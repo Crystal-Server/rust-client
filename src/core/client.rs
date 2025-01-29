@@ -1990,14 +1990,14 @@ impl CrystalServer {
     }
 
     /// Gets a player data through the name if the player is connected.
-    pub async fn get_other_player_name(&self, name: &str) -> Option<Player> {
+    pub async fn get_other_player_name(&self, name: &str) -> Option<(u64, Player)> {
         self.data
             .read()
             .await
             .players
-            .values()
-            .find(|player| player.name == name)
-            .cloned()
+            .iter()
+            .find(|(_pid, player)| player.name == name)
+            .map(|(pid, player)| (*pid, player.clone()))
     }
 
     /// Request a player variable update.
