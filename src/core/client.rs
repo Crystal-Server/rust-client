@@ -2247,13 +2247,28 @@ impl CrystalServer {
 
     /// Checks if the player has reached the requested
     /// achievement.
-    pub async fn has_reached_achievement(&self, aid: u64) -> Option<bool> {
+    pub async fn has_reached_achievement(&self, aid: u64) -> bool {
         let dlock = self.data.read().await;
         if dlock.player_id.is_some() {
             dlock
                 .game_achievements
                 .get(&Leb(aid))
                 .map(|achievement| achievement.unlocked.is_some())
+                .unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
+    /// Get the timestamp (Unix UTC) of when the achievement
+    /// was unlocked if the player has.
+    pub async fn get_reached_achievement(&self, aid: u64) -> Option<i64> {
+        let dlock = self.data.read().await;
+        if dlock.player_id.is_some() {
+            dlock
+                .game_achievements
+                .get(&Leb(aid))
+                .map(|achievement| achievement.unlocked)?
         } else {
             None
         }
@@ -2262,7 +2277,7 @@ impl CrystalServer {
     /// If the player hasn't reached the achievement
     /// then you can reach it with this function.
     pub async fn reach_achievement(&self, aid: u64) -> IoResult<()> {
-        if let Some(false) = self.has_reached_achievement(aid).await {
+        if !self.has_reached_achievement(aid).await {
             let mut dlock = self.data.write().await;
             if dlock.player_id.is_some() {
                 if let Some(achievement) = dlock.game_achievements.get_mut(&Leb(aid)) {
