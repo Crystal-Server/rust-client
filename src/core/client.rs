@@ -2303,11 +2303,11 @@ impl CrystalServer {
 
     /// Returns the highscore on the requested id.
     /// Will return None if the value doesn't exist.
-    pub async fn get_highscore(&self, hid: u64) -> Option<Achievement> {
+    pub async fn get_highscore(&self, hid: u64) -> Option<Highscore> {
         self.data
             .read()
             .await
-            .game_achievements
+            .game_highscores
             .get(&Leb(hid))
             .cloned()
     }
