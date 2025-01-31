@@ -2313,7 +2313,22 @@ impl CrystalServer {
     }
 
     /// Checks if the player has reached the requested
-    /// achievement.
+    /// highscore.
+    pub async fn has_score_highscore(&self, hid: u64) -> bool {
+        let dlock = self.data.read().await;
+        if let Some(player_id) = dlock.player_id {
+            if let Some(highscore) = dlock.game_highscores.get(&Leb(hid)) {
+                highscore.scores.contains_key(&Leb(player_id))
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Returns the player's highscore on the requested
+    /// highscore id.
     pub async fn get_score_highscore(&self, hid: u64) -> Option<f64> {
         let dlock = self.data.read().await;
         if let Some(player_id) = dlock.player_id {
