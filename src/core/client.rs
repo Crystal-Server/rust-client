@@ -2532,7 +2532,7 @@ impl CrystalServer {
     /// if it's trying to kick itself.
     /// Returns a bool if the action succeded or not, an Err(...)
     /// if there was an issue sending the data to the server.
-    pub async fn player_kick(&self, pid: u64, reason: String) -> IoResult<bool> {
+    pub async fn player_kick(&self, pid: u64, reason: &str) -> IoResult<bool> {
         if self.get_player_id().await == Some(pid)
             || self
                 .get_player_admin(self.get_player_id().await.unwrap_or(u64::MAX))
@@ -2541,7 +2541,7 @@ impl CrystalServer {
                 .can_kick
         {
             self.internal_iosend(Self::get_packet_write(&WritePacket::AdminAction(
-                AdminAction::Kick(reason),
+                AdminAction::Kick(reason.to_owned()),
                 pid,
             ))?)
             .await?;
@@ -2559,7 +2559,7 @@ impl CrystalServer {
     pub async fn player_ban(
         &self,
         pid: u64,
-        reason: String,
+        reason: &str,
         unban_time: DateTime<Utc>,
     ) -> IoResult<bool> {
         if self.get_player_id().await == Some(pid)
@@ -2570,7 +2570,7 @@ impl CrystalServer {
                 .can_ban
         {
             self.internal_iosend(Self::get_packet_write(&WritePacket::AdminAction(
-                AdminAction::Ban(reason, unban_time.timestamp()),
+                AdminAction::Ban(reason.to_string(), unban_time.timestamp()),
                 pid,
             ))?)
             .await?;
