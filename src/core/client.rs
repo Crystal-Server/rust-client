@@ -751,7 +751,7 @@ impl CrystalServer {
                                             variables: vari,
                                         },
                                     );
-                                    // TODO: Handle dlock.player_queue
+                                    Self::iter_missing_data(&mut dlock, pid).await?;
                                     if let Some(dup) = &mut dlock.func_data_update {
                                         dup(DataUpdate::PlayerLoggedIn(pid, pname, room));
                                     }
@@ -775,6 +775,7 @@ impl CrystalServer {
                                 }
                                 ReadPacket::UpdatePlayerVariable(pid, upds) => {
                                     let mut dlock = data.write().await;
+                                    Self::iter_missing_data(&mut dlock, pid).await?;
                                     if let Some(player) = dlock.players.get_mut(&pid) {
                                         for upd in &upds {
                                             if let OptionalVariable::Some(value) = upd.value.clone()
@@ -812,6 +813,7 @@ impl CrystalServer {
                                 ReadPacket::UpdateSync(pid, upds) => {
                                     // There's surely a better way to do this, more performantly.
                                     let mut dlock = data.write().await;
+                                    Self::iter_missing_data(&mut dlock, pid).await?;
                                     let mut exists = IntSet::default();
                                     let mut add_pq = IntSet::default();
                                     if let Some(player) = dlock.players.get_mut(&pid) {
@@ -947,6 +949,7 @@ impl CrystalServer {
                                 }
                                 ReadPacket::NewSync(pid, upds) => {
                                     let mut dlock = data.write().await;
+                                    Self::iter_missing_data(&mut dlock, pid).await?;
                                     for (slot, kind, stype, vari) in upds {
                                         if let Some(player) = dlock.players.get_mut(&pid) {
                                             player.syncs.insert(
@@ -979,6 +982,7 @@ impl CrystalServer {
                                 }
                                 ReadPacket::PlayerChangedRooms(pid, room) => {
                                     let mut dlock = data.write().await;
+                                    Self::iter_missing_data(&mut dlock, pid).await?;
                                     if let Some(player) = dlock.players.get_mut(&pid) {
                                         player.room = room;
                                     }
@@ -1009,6 +1013,7 @@ impl CrystalServer {
                                             name,
                                         ) = csu.callback
                                         {
+                                            Self::iter_missing_data(&mut dlock, pid).await?;
                                             if let Some(player) = dlock.players.get_mut(&pid) {
                                                 if let OptionalVariable::Some(value) = vari.clone()
                                                 {
@@ -1623,6 +1628,70 @@ impl CrystalServer {
         }
     }
 
+    #[inline(always)]
+    async fn iter_missing_data(data: &mut StreamData, pid: u64) -> IoResult<()> {
+        if let Some(pq) = data.player_queue.get_mut(&pid) {
+            if let Some(player) = data.players.get_mut(&pid) {
+                for (name, value) in pq.variables.drain() {
+                    if let OptionalVariable::Some(value) = value {
+                        player.variables.insert(name, value);
+                    } else {
+                        player.variables.remove(&name);
+                    }
+                }
+                for (index, osync) in player.syncs.iter_mut().enumerate() {
+                    if osync.is_none() {
+                        if let Some((sni, sn)) = pq
+                            .new_syncs
+                            .iter()
+                            .enumerate()
+                            .find(|(_, sn)| sn.slot == index)
+                        {
+                            *osync = Some(types::Sync {
+                                event: SyncEvent::New,
+                                kind: sn.kind,
+                                sync_type: sn.sync_type,
+                                variables: sn.variables.clone(),
+                                is_ending: false,
+                            });
+                            pq.new_syncs.remove(sni);
+                        }
+                    }
+                    if let Some(sync) = osync {
+                        if let Some((sni, _)) = pq
+                            .new_syncs
+                            .iter()
+                            .enumerate()
+                            .find(|(_, sn)| sn.slot == index)
+                        {
+                            pq.new_syncs.remove(sni);
+                        }
+                        if let Some(is) = pq.syncs.remove(&index) {
+                            for (name, value) in is {
+                                if let OptionalVariable::Some(value) = value {
+                                    sync.variables.insert(name, value);
+                                } else {
+                                    sync.variables.remove(&name);
+                                }
+                            }
+                        }
+                        if let Some((index, _)) = pq
+                            .remove_syncs
+                            .iter()
+                            .enumerate()
+                            .find(|(rindex, _)| *rindex == index)
+                        {
+                            sync.is_ending = true;
+                            pq.remove_syncs.remove(index);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Update the Crystal Server runtime.
     /// This function sends a lot of data in a compressed manner,
     /// if this is NOT called, Crystal Server WILL not work PROPERLY.
@@ -1672,6 +1741,7 @@ impl CrystalServer {
                         }
                     }
                 }
+                Self::iter_missing_data(&mut dlock, pid).await?;
                 if is_all_none && player_logged_out {
                     dlock.players.remove(&pid);
                     dlock.players_logout.remove(&pid);
