@@ -513,14 +513,22 @@ impl CrystalServer {
     }
 
     pub async fn connect(&mut self) {
+        #[cfg(feature = "__dev")]
+        info!("Connecting to the server");
         {
+            #[cfg(feature = "__dev")]
+            info!("Fetching stream data");
             let mut lock = self.data.write().await;
             if let Some(thread) = &mut lock.thread {
+                #[cfg(feature = "__dev")]
+                info!("Aborting thread");
                 if !thread.is_finished() {
                     thread.abort();
                 }
             }
             lock.is_connecting = true;
+            #[cfg(feature = "__dev")]
+            info!("Stream data OK");
         }
         let url = if let Some(url) = self.data.read().await.last_host.clone() {
             url
@@ -529,16 +537,24 @@ impl CrystalServer {
         } else {
             String::from("ws://server.crystal-server.co:16562")
         };
+        #[cfg(feature = "__dev")]
+        info!("Connecting to server at {url}");
         match tokio_tungstenite::connect_async(url).await {
             Ok((ws, _)) => {
+                #[cfg(feature = "__dev")]
+                info!("Connection OK, initializing");
                 let stream = StreamHandler::split_stream(ws).await;
                 let writer = Arc::new(Mutex::new(stream.1));
                 self.writer = Some(writer.clone());
+                #[cfg(feature = "__dev")]
+                info!("Stream setup OK");
                 let thread =
                     tokio::spawn(Self::stream_handler(stream.0, writer, self.data.clone()));
                 {
                     let mut lock = self.data.write().await;
                     lock.thread = Some(thread);
+                    #[cfg(feature = "__dev")]
+                    info!("Stream data thread OK");
                 }
             }
             Err(_e) => {
@@ -576,6 +592,9 @@ impl CrystalServer {
                     );
                 };
             }
+
+            #[cfg(feature = "__dev")]
+            info!("Initialized stream handle task");
 
             loop {
                 match reader.read().await {
