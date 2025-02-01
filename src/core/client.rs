@@ -1046,7 +1046,6 @@ impl CrystalServer {
                                             }
                                         }
                                     }
-                                    dlock.callback_server_update.remove(index as usize);
                                 }
                                 ReadPacket::AdminAction(aa) => {
                                     let mut dlock = data.write().await;
