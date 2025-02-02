@@ -2177,12 +2177,13 @@ impl CrystalServer {
 
     /// Gets a player data through the name if the player is connected.
     pub async fn get_other_player_name(&self, name: &str) -> Option<(u64, Player)> {
+        let name = name.to_lowercase();
         self.data
             .read()
             .await
             .players
             .iter()
-            .find(|(_pid, player)| player.name == name)
+            .find(|(_pid, player)| player.name.to_lowercase() == name)
             .map(|(pid, player)| (*pid, player.clone()))
     }
 
