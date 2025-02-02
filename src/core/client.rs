@@ -124,9 +124,9 @@ pub struct StreamData {
     last_ping: Option<Instant>,
 
     new_sync_queue: Vec<NewSyncQueue>,
-    update_variable: HashMap<String, OptionalVariable>,
-    update_playerini: HashMap<String, OptionalVariable>,
-    update_gameini: HashMap<String, OptionalVariable>,
+    update_variable: HashSet<String>,
+    update_playerini: HashSet<String>,
+    update_gameini: HashSet<String>,
     callback_server_update: Vec<Option<CallbackServerUpdate>>,
     call_disconnected: bool,
 
@@ -835,31 +835,59 @@ impl CrystalServer {
                                     Self::iter_missing_data(&mut dlock, pid).await?;
                                     let mut exists = IntSet::default();
                                     let mut add_pq = IntSet::default();
+                                    #[cfg(feature = "__dev")]
+                                    info!("UpdateSync >>> {pid:?},{upds:?}");
                                     if let Some(player) = dlock.players.get_mut(&pid) {
+                                        #[cfg(feature = "__dev")]
+                                        info!("Got Player");
                                         for upd in &upds {
+                                            #[cfg(feature = "__dev")]
+                                            info!("Iterating over update {upd:?}");
                                             if let Some(Some(sync)) = player.syncs.get_mut(upd.slot)
                                             {
+                                                #[cfg(feature = "__dev")]
+                                                info!("Got sync {sync:?}");
                                                 exists.insert(upd.slot);
                                                 if let Some(vari) = &upd.variables {
+                                                    #[cfg(feature = "__dev")]
+                                                    info!("Got variable updates: {vari:?}");
                                                     for (vname, value) in vari {
+                                                        #[cfg(feature = "__dev")]
+                                                        info!(
+                                                            "Itering over {vname:?} >>> {value:?}"
+                                                        );
                                                         if let OptionalVariable::Some(value) =
                                                             value.clone()
                                                         {
-                                                            player
-                                                                .variables
+                                                            #[cfg(feature = "__dev")]
+                                                            info!("Set");
+                                                            sync.variables
                                                                 .insert(vname.clone(), value);
                                                         } else {
-                                                            player.variables.remove(vname);
+                                                            #[cfg(feature = "__dev")]
+                                                            info!("Removed");
+                                                            sync.variables.remove(vname);
                                                         }
                                                     }
                                                 } else if upd.remove_sync {
+                                                    #[cfg(feature = "__dev")]
+                                                    info!("Marked as sync is ending");
                                                     sync.is_ending = true;
+                                                } else {
+                                                    #[cfg(feature = "__dev")]
+                                                    info!("No updates triggered");
                                                 }
+                                                #[cfg(feature = "__dev")]
+                                                info!("Finished iterating over sync {sync:?}");
                                             } else {
+                                                #[cfg(feature = "__dev")]
+                                                info!("Added sync to PlayerQueue");
                                                 add_pq.insert(pid);
                                             }
                                         }
                                     } else {
+                                        #[cfg(feature = "__dev")]
+                                        info!("Added to PlayerQueue");
                                         add_pq.insert(pid);
                                     }
                                     for pid in exists {
@@ -884,6 +912,7 @@ impl CrystalServer {
                                     }
                                     for pid in add_pq {
                                         for upd in &upds {
+                                            // TODO: Only add for those Syncs that weren't iterated over, otherwise this will cause data-loss.
                                             dlock
                                                 .player_queue
                                                 .entry(pid)
@@ -1016,10 +1045,21 @@ impl CrystalServer {
                                 }
                                 ReadPacket::UpdatePlayerData(pid, syncs, vari) => {
                                     let mut dlock = data.write().await;
-                                    if let Some(player) = dlock.players.get_mut(&pid) {
-                                        player.syncs = syncs;
-                                        player.variables = vari;
+                                    #[cfg(feature = "__dev")]
+                                    info!("{pid:?}, {syncs:?}, {vari:?}");
+                                    if dlock.players.contains_key(&pid) {
+                                        #[cfg(feature = "__dev")]
+                                        info!("OK");
+                                        Self::iter_missing_data(&mut dlock, pid).await?;
+                                        if let Some(player) = dlock.players.get_mut(&pid) {
+                                            player.syncs = syncs;
+                                            player.variables = vari;
+                                            #[cfg(feature = "__dev")]
+                                            info!("{player:?}");
+                                        }
                                     }
+                                    #[cfg(feature = "__dev")]
+                                    info!("END");
                                 }
                                 ReadPacket::RequestPlayerVariable(index, vari) => {
                                     let mut dlock = data.write().await;
@@ -1715,39 +1755,37 @@ impl CrystalServer {
     /// if this is NOT called, Crystal Server WILL not work PROPERLY.
     #[inline(always)]
     pub async fn update(&self) -> IoResult<()> {
-        if self.is_connected().await {
-            //let timestamp = Utc::now().timestamp();
-            let mut dlock = self.data.write().await;
-            if let Some(ping) = dlock.last_ping {
-                if ping.elapsed().as_secs_f64() >= 90.0 {
-                    self.disconnect().await;
-                    if let Some(dup) = self.data.write().await.func_data_update.as_mut() {
-                        dup(DataUpdate::Disconnected());
-                    }
-                }
+        let conn = self.is_connected().await;
+        let mut dlock = self.data.write().await;
+        if let Some(room_callback) = &mut dlock.func_room {
+            let result = room_callback();
+            if dlock.room != result && conn {
+                self.internal_iosend(Self::get_packet_write(&WritePacket::UpdateRoom(
+                    result.clone(),
+                ))?)
+                .await?;
             }
-            if let Some(room_callback) = &mut dlock.func_room {
-                let result = room_callback();
-                if dlock.room != result {
-                    self.internal_iosend(Self::get_packet_write(&WritePacket::UpdateRoom(
-                        result.clone(),
-                    ))?)
-                    .await?;
-                }
-                dlock.room = result;
-            }
+            dlock.room = result;
+        }
+        if conn {
             let lroom = dlock.room.clone();
+            //let timestamp = Utc::now().timestamp();
             for pid in dlock.players.keys().cloned().collect::<Vec<u64>>() {
                 let player_logged_out = dlock.players_logout.contains(&pid);
                 let mut is_all_none = true;
+                Self::iter_missing_data(&mut dlock, pid).await?;
                 let player = dlock
                     .players
                     .get_mut(&pid)
                     .ok_or(Error::new(ErrorKind::NotFound, "player not found"))?;
                 for sync in &mut player.syncs {
                     if let Some(msync) = sync {
+                        /*#[cfg(feature = "__dev")]
+                        info!("Got sync {msync:?} for pid {pid}");*/
                         is_all_none = false;
                         if msync.event == SyncEvent::End {
+                            #[cfg(feature = "__dev")]
+                            info!("Sync END {pid}");
                             drop(sync.take());
                             continue;
                         }
@@ -1755,11 +1793,12 @@ impl CrystalServer {
                             || player.room != lroom
                             || player_logged_out
                         {
+                            #[cfg(feature = "__dev")]
+                            info!("Marked as Sync END {pid}");
                             msync.event = SyncEvent::End;
                         }
                     }
                 }
-                Self::iter_missing_data(&mut dlock, pid).await?;
                 if is_all_none && player_logged_out {
                     dlock.players.remove(&pid);
                     dlock.players_logout.remove(&pid);
@@ -1771,25 +1810,19 @@ impl CrystalServer {
                     }
                 }
             }
-            if !dlock.syncs.is_empty() && !dlock.syncs_remove.is_empty() {
+            if !dlock.syncs.is_empty() || !dlock.syncs_remove.is_empty() {
                 let mut upds = Vec::new();
-                for remove in dlock.syncs_remove.drain(..) {
-                    upds.push(SyncUpdate {
-                        slot: remove,
-                        remove_sync: true,
-                        variables: None,
-                    });
-                }
                 for (index, sync) in dlock.syncs.iter_mut().enumerate() {
                     if let Some(sync) = sync {
                         if !sync.to_sync.is_empty() {
+                            #[cfg(feature = "__dev")]
+                            info!(
+                                "updating sync variables on slot {index}: {:?}",
+                                sync.to_sync
+                            );
                             let mut variupd = HashMap::new();
                             for upd in sync.to_sync.drain() {
-                                let vari = if let Some(vari) = sync.variables.get(&upd).cloned() {
-                                    OptionalVariable::Some(vari)
-                                } else {
-                                    OptionalVariable::None
-                                };
+                                let vari = sync.variables.get(&upd).cloned().into();
                                 variupd.insert(upd, vari);
                             }
                             upds.push(SyncUpdate {
@@ -1799,6 +1832,13 @@ impl CrystalServer {
                             });
                         }
                     }
+                }
+                for remove in dlock.syncs_remove.drain(..) {
+                    upds.push(SyncUpdate {
+                        slot: remove,
+                        remove_sync: true,
+                        variables: None,
+                    });
                 }
                 if !upds.is_empty() {
                     self.internal_iosend(Self::get_packet_write(&WritePacket::UpdateSync(upds))?)
@@ -1832,7 +1872,9 @@ impl CrystalServer {
             }
             if !dlock.update_variable.is_empty() {
                 let mut data = Vec::new();
-                for (name, value) in dlock.update_variable.drain() {
+                let variupds = dlock.update_variable.drain().collect::<Vec<String>>();
+                for name in variupds {
+                    let value = dlock.variables.get(&name).cloned().into();
                     data.push(VariableUpdate { name, value });
                 }
                 self.internal_iosend(Self::get_packet_write(&WritePacket::UpdatePlayerVariable(
@@ -1842,7 +1884,9 @@ impl CrystalServer {
             }
             if !dlock.update_playerini.is_empty() {
                 let mut data: Vec<VariableUpdate> = Vec::new();
-                for (name, value) in dlock.update_playerini.drain() {
+                let variupds = dlock.update_playerini.drain().collect::<Vec<String>>();
+                for name in variupds {
+                    let value = dlock.player_save.get(&name).cloned().into();
                     data.push(VariableUpdate { name, value });
                 }
                 self.internal_iosend(Self::get_packet_write(&WritePacket::PlayerIniWrite(data))?)
@@ -1850,14 +1894,24 @@ impl CrystalServer {
             }
             if !dlock.update_gameini.is_empty() {
                 let mut data: Vec<VariableUpdate> = Vec::new();
-                for (name, value) in dlock.update_gameini.drain() {
+                let variupds = dlock.update_gameini.drain().collect::<Vec<String>>();
+                for name in variupds {
+                    let value = dlock.game_save.get(&name).cloned().into();
                     data.push(VariableUpdate { name, value });
                 }
                 self.internal_iosend(Self::get_packet_write(&WritePacket::GameIniWrite(data))?)
                     .await?;
             }
+            if let Some(ping) = dlock.last_ping {
+                if ping.elapsed().as_secs_f64() >= 90.0 {
+                    drop(dlock);
+                    self.disconnect().await;
+                    if let Some(dup) = self.data.write().await.func_data_update.as_mut() {
+                        dup(DataUpdate::Disconnected());
+                    }
+                }
+            }
         } else {
-            let mut dlock = self.data.write().await;
             if dlock.is_loggedin {
                 dlock.is_loggedin = false;
             }
@@ -1963,6 +2017,16 @@ impl CrystalServer {
                 Err(e) => {
                     #[cfg(feature = "__dev")]
                     info!("unable to send data to server with error: {e:?}");
+                    let mut dlock = self.data.write().await;
+                    dlock.clear(true).await;
+                    if dlock.call_disconnected {
+                        if let Some(func) = dlock.func_disconnected.as_mut() {
+                            func();
+                        }
+                        if let Some(dup) = dlock.func_data_update.as_mut() {
+                            dup(DataUpdate::Disconnected());
+                        }
+                    }
                     Err(Error::new(ErrorKind::BrokenPipe, format!("{e:?}")))
                 }
             }
@@ -2039,20 +2103,22 @@ impl CrystalServer {
 
     /// Sets the player variable with the name and value provided.
     pub async fn set_variable(&self, name: &str, value: Variable) {
-        self.data
-            .write()
-            .await
-            .update_variable
-            .insert(name.to_owned(), OptionalVariable::Some(value));
+        let mut dlock = self.data.write().await;
+        if let Some(orgvalue) = dlock.variables.get(name) {
+            if value == *orgvalue {
+                return;
+            }
+        }
+        dlock.variables.insert(name.to_owned(), value);
+        dlock.update_variable.insert(name.to_owned());
     }
 
     /// Removes the player variable with the provided name.
     pub async fn remove_variable(&self, name: &str) {
-        self.data
-            .write()
-            .await
-            .update_variable
-            .insert(name.to_owned(), OptionalVariable::None);
+        let mut dlock = self.data.write().await;
+        if dlock.variables.remove(name).is_some() {
+            dlock.update_variable.insert(name.to_owned());
+        }
     }
 
     /// Stream to fetch all current player (excluding this client) data.
@@ -2156,10 +2222,13 @@ impl CrystalServer {
     /// but this can be ignored safely.
     pub async fn set_version(&self, version: f64) -> IoResult<()> {
         self.data.write().await.version = version;
-        self.internal_iosend(Self::get_packet_write(&WritePacket::UpdateGameVersion(
-            version,
-        ))?)
-        .await
+        if self.is_connected().await {
+            self.internal_iosend(Self::get_packet_write(&WritePacket::UpdateGameVersion(
+                version,
+            ))?)
+            .await?;
+        }
+        Ok(())
     }
 
     /// Gets the current set version.
@@ -2177,10 +2246,13 @@ impl CrystalServer {
     /// but this can be ignored safely.
     pub async fn set_session(&self, session: &str) -> IoResult<()> {
         self.data.write().await.session = session.to_owned();
-        self.internal_iosend(Self::get_packet_write(&WritePacket::UpdateGameSession(
-            session.to_owned(),
-        ))?)
-        .await
+        if self.is_connected().await {
+            self.internal_iosend(Self::get_packet_write(&WritePacket::UpdateGameSession(
+                session.to_owned(),
+            ))?)
+            .await?;
+        }
+        Ok(())
     }
 
     /// Gets the current set session.
@@ -2243,20 +2315,22 @@ impl CrystalServer {
     pub async fn set_playerini(&self, section: &str, key: &str, value: Variable) {
         let mut dlock = self.data.write().await;
         let save_key = Self::get_save_key(&dlock.player_open_save, section, key);
+        if let Some(orgvalue) = dlock.player_save.get(&save_key) {
+            if value == *orgvalue {
+                return;
+            }
+        }
         dlock.player_save.insert(save_key.clone(), value.clone());
-        dlock
-            .update_playerini
-            .insert(save_key, OptionalVariable::Some(value));
+        dlock.update_playerini.insert(save_key);
     }
 
     /// Removes the stored value for the requested entry in the currently open playerini file.
     pub async fn remove_playerini(&self, section: &str, key: &str) {
         let mut dlock = self.data.write().await;
         let save_key = Self::get_save_key(&dlock.player_open_save, section, key);
-        dlock.player_save.remove(&save_key);
-        dlock
-            .update_playerini
-            .insert(save_key, OptionalVariable::None);
+        if dlock.player_save.remove(&save_key).is_some() {
+            dlock.update_playerini.insert(save_key);
+        }
     }
 
     /// Gets the currently open gameini file.
@@ -2297,20 +2371,22 @@ impl CrystalServer {
     pub async fn set_gameini(&self, section: &str, key: &str, value: Variable) {
         let mut dlock = self.data.write().await;
         let save_key = Self::get_save_key(&dlock.game_open_save, section, key);
+        if let Some(orgvalue) = dlock.game_save.get(&save_key) {
+            if value == *orgvalue {
+                return;
+            }
+        }
         dlock.game_save.insert(save_key.clone(), value.clone());
-        dlock
-            .update_gameini
-            .insert(save_key, OptionalVariable::Some(value));
+        dlock.update_gameini.insert(save_key);
     }
 
     /// Removes the stored value for the requested entry in the currently open gameini file.
     pub async fn remove_gameini(&self, section: &str, key: &str) {
         let mut dlock = self.data.write().await;
         let save_key = Self::get_save_key(&dlock.game_open_save, section, key);
-        dlock.game_save.remove(&save_key);
-        dlock
-            .update_gameini
-            .insert(save_key, OptionalVariable::None);
+        if dlock.game_save.remove(&save_key).is_some() {
+            dlock.update_gameini.insert(save_key);
+        }
     }
 
     /// Checks if the requested achievement exists.
@@ -2501,8 +2577,8 @@ impl CrystalServer {
     pub async fn set_variable_sync(&self, sync: usize, name: &str, value: Variable) {
         let mut dlock = self.data.write().await;
         if let Some(Some(sync)) = dlock.syncs.get_mut(sync) {
-            if let Some(old_value) = sync.variables.get(name) {
-                if old_value == &value {
+            if let Some(orgvalue) = sync.variables.get(name) {
+                if value == *orgvalue {
                     return;
                 }
             }
@@ -2559,7 +2635,8 @@ impl CrystalServer {
         let data = self.data.clone();
 
         Box::pin(async_stream::stream! {
-            for id in data.read().await.players.keys().cloned().collect::<Vec<u64>>() {
+            let pids = data.read().await.players.keys().cloned().collect::<Vec<u64>>();
+            for id in pids {
                 let player_data = data.read().await.players.get(&id).cloned();
                 if let Some(player) = player_data {
                     let syncs_data = player.syncs.iter().cloned().enumerate();
