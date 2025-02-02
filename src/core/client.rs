@@ -173,6 +173,7 @@ macro_rules! unwrap_return {
 impl StreamData {
     pub async fn clear(&mut self, full: bool) {
         self.is_loggedin = false;
+        self.call_disconnected = true;
 
         self.player_name = None;
         self.player_id = None;
@@ -527,6 +528,7 @@ impl CrystalServer {
                     thread.abort();
                 }
             }
+            lock.clear(true).await;
             lock.is_connecting = true;
             #[cfg(feature = "__dev")]
             info!("Stream data OK");
@@ -562,6 +564,16 @@ impl CrystalServer {
                 #[cfg(feature = "__dev")]
                 info!("Connection error: {_e:?}");
                 let mut dlock = self.data.write().await;
+                dlock.clear(true).await;
+                if dlock.call_disconnected {
+                    if let Some(func) = dlock.func_disconnected.as_mut() {
+                        func();
+                    }
+                    if let Some(dup) = dlock.func_data_update.as_mut() {
+                        dup(DataUpdate::Disconnected());
+                    }
+                    dlock.call_disconnected = false;
+                }
                 if dlock.last_host.take().is_some() {
                     drop(dlock);
                     Box::pin(self.connect()).await;
@@ -1323,26 +1335,35 @@ impl CrystalServer {
                 }
             }
         });
-        if let Err(e) = task.await {
-            {
-                let mut dlock = cdata.write().await;
-                dlock.clear(true).await;
-                dlock.registered_errors.push(if e.is_panic() {
-                    ClientError::HandlerPanic(format!("{:?}", e.into_panic()))
-                } else {
-                    ClientError::HandlerResult(Ok(())) // TODO: Change this into the actual error
-                });
-                if dlock.call_disconnected {
-                    if let Some(func) = dlock.func_disconnected.as_mut() {
-                        func();
-                    }
-                    if let Some(dup) = dlock.func_data_update.as_mut() {
-                        dup(DataUpdate::Disconnected());
-                    }
-                }
-            }
-            cwriter.lock().await.shutdown().await;
+        let mut dlock;
+        if let Err(_e) = task.await {
+            dlock = cdata.write().await;
+            #[cfg(feature = "__dev")]
+            info!("Stream handler closed with error: {_e:?}");
+            dlock.registered_errors.push(if _e.is_panic() {
+                ClientError::HandlerPanic(format!("{:?}", _e.into_panic()))
+            } else {
+                ClientError::HandlerResult(Ok(())) // TODO: Change this into the actual error
+            });
+        } else {
+            dlock = cdata.write().await;
+            dlock
+                .registered_errors
+                .push(ClientError::HandlerResult(Ok(())));
         }
+        {
+            dlock.clear(true).await;
+            if dlock.call_disconnected {
+                if let Some(func) = dlock.func_disconnected.as_mut() {
+                    func();
+                }
+                if let Some(dup) = dlock.func_data_update.as_mut() {
+                    dup(DataUpdate::Disconnected());
+                }
+                dlock.call_disconnected = false;
+            }
+        }
+        cwriter.lock().await.shutdown().await;
     }
 
     #[inline(always)]
@@ -2036,6 +2057,7 @@ impl CrystalServer {
                         if let Some(dup) = dlock.func_data_update.as_mut() {
                             dup(DataUpdate::Disconnected());
                         }
+                        dlock.call_disconnected = false;
                     }
                     Err(Error::new(ErrorKind::BrokenPipe, format!("{e:?}")))
                 }
