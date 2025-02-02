@@ -894,29 +894,33 @@ impl CrystalServer {
                                         info!("Added to PlayerQueue");
                                         add_pq.insert(pid);
                                     }
-                                    for pid in exists {
-                                        for upd in &upds {
+                                    for slot in exists {
+                                        if let Some(upd) =
+                                            upds.iter().find(|supd| supd.slot == slot)
+                                        {
                                             if let Some(dup) = &mut dlock.func_data_update {
                                                 if let Some(vari) = &upd.variables {
                                                     for (vname, value) in vari {
                                                         dup(DataUpdate::UpdateSyncVariable(
-                                                            pid as u64,
-                                                            upd.slot,
+                                                            pid,
+                                                            slot,
                                                             vname.clone(),
                                                             value.clone(),
                                                         ));
                                                     }
                                                 } else if upd.remove_sync {
-                                                    dup(DataUpdate::UpdateSyncRemoval(
-                                                        pid as u64, upd.slot,
-                                                    ));
+                                                    dup(DataUpdate::UpdateSyncRemoval(pid, slot));
                                                 }
                                             }
                                         }
                                     }
                                     for pid in add_pq {
                                         for upd in &upds {
-                                            // TODO: Only add for those Syncs that weren't iterated over, otherwise this will cause data-loss.
+                                            if let Some(player) = dlock.players.get(&pid) {
+                                                if let Some(Some(_)) = player.syncs.get(upd.slot) {
+                                                    continue;
+                                                }
+                                            }
                                             dlock
                                                 .player_queue
                                                 .entry(pid)
@@ -1001,7 +1005,6 @@ impl CrystalServer {
                                 }
                                 ReadPacket::NewSync(pid, upds) => {
                                     let mut dlock = data.write().await;
-                                    Self::iter_missing_data(&mut dlock, pid).await?;
                                     for (slot, kind, stype, vari) in upds {
                                         if let Some(player) = dlock.players.get_mut(&pid) {
                                             player.syncs.insert(
@@ -1014,6 +1017,7 @@ impl CrystalServer {
                                                     is_ending: false,
                                                 }),
                                             );
+                                            Self::iter_missing_data(&mut dlock, pid).await?;
                                         } else {
                                             dlock
                                                 .player_queue
