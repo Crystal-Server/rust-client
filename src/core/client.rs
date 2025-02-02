@@ -2140,7 +2140,7 @@ impl CrystalServer {
     }
 
     /// Gets the current amount of players. (excluding this client.)
-    pub async fn other_players_count(&self) -> usize {
+    pub async fn other_player_count(&self) -> usize {
         self.data.read().await.players.len()
     }
 
