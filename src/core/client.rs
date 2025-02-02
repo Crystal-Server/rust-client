@@ -173,9 +173,6 @@ macro_rules! unwrap_return {
 impl StreamData {
     pub async fn clear(&mut self, full: bool) {
         self.is_loggedin = false;
-        self.is_connected = false;
-        self.is_connecting = false;
-        self.is_reconnecting = false;
 
         self.player_name = None;
         self.player_id = None;
@@ -188,6 +185,10 @@ impl StreamData {
         self.update_playerini.clear();
         self.callback_server_update.clear();
         if full {
+            self.is_connecting = false;
+            self.is_connected = false;
+            self.is_reconnecting = false;
+
             self.game_save.clear();
             self.game_open_save.clear();
             self.game_achievements.clear();
@@ -1089,6 +1090,8 @@ impl CrystalServer {
                                 }
                                 ReadPacket::AdminAction(aa) => {
                                     let mut dlock = data.write().await;
+                                    dlock.clear(false).await;
+                                    dlock.is_loggedin = false;
                                     match aa.clone() {
                                         AdminAction::Ban(reason, unban_time) => {
                                             if let Some(callback) = &mut dlock.func_banned {
