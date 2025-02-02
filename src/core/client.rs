@@ -743,7 +743,10 @@ impl CrystalServer {
                                     }
                                     if let Some(token) = token {
                                         if let Some(log) = &mut dlock.func_login_token {
-                                            log(token)
+                                            log(token.clone());
+                                        }
+                                        if let Some(dup) = &mut dlock.func_data_update {
+                                            dup(DataUpdate::LoginToken(token));
                                         }
                                     }
                                 }

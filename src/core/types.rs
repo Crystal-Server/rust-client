@@ -170,6 +170,8 @@ pub enum DataUpdate {
     Banned(String, DateTime<Utc>),
     /// Notification Message
     ServerNotification(String),
+    /// Login Token
+    LoginToken(String),
 }
 
 #[derive(Default, Copy, Clone, Debug, TryFromPrimitive, PartialEq, Eq, PartialOrd, Ord)]
