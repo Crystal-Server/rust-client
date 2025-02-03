@@ -43,7 +43,7 @@ use tracing::{info, warn};
 
 pub struct CrystalServer {
     writer: Option<Arc<Mutex<StreamWriter>>>,
-    data: Arc<RwLock<StreamData>>,
+    pub data: Arc<RwLock<StreamData>>,
 }
 
 struct StreamHandler;
@@ -113,7 +113,7 @@ pub struct StreamData {
     game_administrators: IntMap<Leb<u64>, Administrator>,
     game_version: f64,
 
-    players: IntMap<u64, Player>,
+    pub players: IntMap<u64, Player>,
     players_logout: IntSet<u64>,
     player_queue: IntMap<u64, PlayerQueue>,
     variables: HashMap<String, Variable>,
@@ -1070,7 +1070,7 @@ impl CrystalServer {
                                     if dlock.players.contains_key(&pid) {
                                         #[cfg(feature = "__dev")]
                                         info!("OK");
-                                        Self::iter_missing_data(&mut dlock, pid).await?;
+                                        dlock.player_queue.remove(&pid);
                                         if let Some(player) = dlock.players.get_mut(&pid) {
                                             player.syncs = syncs;
                                             player.variables = vari;
