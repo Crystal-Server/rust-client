@@ -229,7 +229,7 @@ impl StreamReader {
             if let Some(Ok(frame)) = stream.next().await {
                 if frame.is_binary() {
                     let data = frame.into_data();
-                    if !data.is_empty() && data.len() <= 0x40_000_000 {
+                    if !data.is_empty() {
                         if let Some(identity) = &self.identity {
                             let len = data.len();
                             if let Ok(decryptor) =
@@ -269,6 +269,8 @@ impl StreamReader {
                     Err(ReaderError::StreamClosed(String::from(
                         "ws stream requested to close",
                     )))
+                } else if frame.is_ping() {
+                    Ok(Buffer::empty())
                 } else {
                     Err(ReaderError::Unknown(format!(
                         "obtained an unexpected code for ws: {frame:?}",
@@ -354,6 +356,19 @@ impl StreamWriter {
             Err(WriterError::Unknown(String::from(
                 "no stream open to write to",
             )))
+        }
+    }
+
+    #[inline(always)]
+    pub async fn write_pong(&mut self) -> IoResult<()> {
+        if let Some(stream) = self.stream.as_mut() {
+            if stream.send(Message::Pong(Bytes::new())).await.is_err() {
+                Err(Error::from(ErrorKind::BrokenPipe))
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(Error::from(ErrorKind::BrokenPipe))
         }
     }
 
@@ -611,7 +626,10 @@ impl CrystalServer {
 
             loop {
                 match reader.read().await {
-                    Ok(buffer) => {
+                    Ok(mut buffer) => {
+                        if buffer.is_empty()? {
+                            continue;
+                        }
                         if let Ok(packet) = CrystalServer::get_packet_read(buffer) {
                             #[cfg(feature = "__dev")]
                             info!("reading packet: {packet:?}");
@@ -698,7 +716,10 @@ impl CrystalServer {
                                         dlock.ping = ping;
                                         dlock.last_ping = Some(Instant::now());
                                     } else {
-                                        write_packet!(WritePacket::Ping());
+                                        {
+                                            write_packet!(WritePacket::Ping());
+                                        }
+                                        writer.lock().await.write_pong().await?;
                                     }
                                 }
                                 ReadPacket::ForceDisconnection() => {
