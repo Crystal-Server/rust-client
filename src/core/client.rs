@@ -175,8 +175,8 @@ impl StreamData {
         self.is_loggedin = false;
         self.call_disconnected = true;
 
-        self.player_name = None;
-        self.player_id = None;
+        self.player_name.take();
+        self.player_id.take();
         self.player_save.clear();
         self.player_open_save.clear();
         self.player_queue.clear();
@@ -185,6 +185,8 @@ impl StreamData {
         self.update_variable.clear();
         self.update_playerini.clear();
         self.callback_server_update.clear();
+        self.players.clear();
+
         if full {
             self.is_connecting = false;
             self.is_connected = false;
@@ -196,7 +198,8 @@ impl StreamData {
             self.game_highscores.clear();
             self.game_administrators.clear();
             self.update_gameini.clear();
-            self.last_ping = None;
+
+            self.last_ping.take();
             self.handshake_completed = false;
         }
     }
