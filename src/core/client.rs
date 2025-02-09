@@ -187,6 +187,7 @@ impl StreamData {
         self.update_variable.clear();
         self.update_playerini.clear();
         self.callback_server_update.clear();
+        self.callback_server_index = 0;
         self.players.clear();
 
         if full {
