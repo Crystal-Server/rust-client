@@ -82,6 +82,7 @@ pub struct NewSyncQueue {
     pub sync_type: SyncType,
 }
 
+#[derive(Debug)]
 pub struct CallbackServerUpdate {
     pub name: String,
     pub callback: ServerUpdateCallback,
@@ -300,6 +301,21 @@ pub enum ChangeFriendStatus {
     Friend = 5,
     #[default]
     NotFriend = 6,
+}
+
+impl std::fmt::Debug for ServerUpdateCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::None => "None",
+                Self::FetchBdb(_, _) => "FetchBdb(...)",
+                Self::PlayerVariable(_, _, _) => "PlayerVariable(...)",
+                Self::SyncVariable(_, _, _, _) => "SyncVariable(...)",
+            }
+        )
+    }
 }
 
 impl Serialize for Sync {

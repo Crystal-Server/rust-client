@@ -127,8 +127,10 @@ pub struct StreamData {
     update_variable: HashSet<String>,
     update_playerini: HashSet<String>,
     update_gameini: HashSet<String>,
-    callback_server_update: Vec<Option<CallbackServerUpdate>>,
     call_disconnected: bool,
+
+    callback_server_update: IntMap<u64, Option<CallbackServerUpdate>>,
+    callback_server_index: u64,
 
     handshake_completed: bool,
 
@@ -1107,8 +1109,15 @@ impl CrystalServer {
                                 }
                                 ReadPacket::RequestPlayerVariable(index, vari) => {
                                     let mut dlock = data.write().await;
-                                    if let Some(csu) =
-                                        dlock.callback_server_update.remove(index as usize)
+                                    #[cfg(feature = "__dev")]
+                                    info!(
+                                        "RequestPlayerVariable->{:?}->{index:?}",
+                                        dlock.callback_server_update
+                                    );
+                                    if let Some(Some(csu)) = dlock
+                                        .callback_server_update
+                                        .get_mut(&index)
+                                        .map(|csu| csu.take())
                                     {
                                         if let ServerUpdateCallback::PlayerVariable(
                                             callback,
@@ -1170,8 +1179,8 @@ impl CrystalServer {
                                 }
                                 ReadPacket::RequestSyncVariable(index, vari) => {
                                     let mut dlock = data.write().await;
-                                    if let Some(csu) =
-                                        dlock.callback_server_update.remove(index as usize)
+                                    if let Some(Some(csu)) =
+                                        dlock.callback_server_update.remove(&index)
                                     {
                                         if let ServerUpdateCallback::SyncVariable(
                                             callback,
@@ -1212,7 +1221,6 @@ impl CrystalServer {
                                             }
                                         }
                                     }
-                                    dlock.callback_server_update.remove(index as usize);
                                 }
                                 ReadPacket::ChangeGameVersion(ver) => {
                                     let mut dlock = data.write().await;
@@ -1285,8 +1293,10 @@ impl CrystalServer {
                                 }
                                 ReadPacket::RequestBdb(index, bdb) => {
                                     let mut dlock = data.write().await;
-                                    if let Some(csu) =
-                                        dlock.callback_server_update.remove(index as usize)
+                                    if let Some(Some(csu)) = dlock
+                                        .callback_server_update
+                                        .get_mut(&index)
+                                        .map(|csu| csu.take())
                                     {
                                         if let Some(callback) = &mut dlock.func_bdb {
                                             callback(csu.name.clone(), bdb.clone());
@@ -2226,26 +2236,28 @@ impl CrystalServer {
             let index = if let Some((index, csu)) = dlock
                 .callback_server_update
                 .iter_mut()
-                .enumerate()
                 .find(|(_, csu)| csu.is_none())
             {
                 *csu = Some(CallbackServerUpdate {
                     name: name.to_owned(),
                     callback: ServerUpdateCallback::PlayerVariable(callback, pid, name.to_owned()),
                 });
-                index
+                *index
             } else {
-                dlock
-                    .callback_server_update
-                    .push(Some(CallbackServerUpdate {
+                let index = dlock.callback_server_index;
+                dlock.callback_server_update.insert(
+                    index,
+                    Some(CallbackServerUpdate {
                         name: name.to_owned(),
                         callback: ServerUpdateCallback::PlayerVariable(
                             callback,
                             pid,
                             name.to_owned(),
                         ),
-                    }));
-                dlock.callback_server_update.len() - 1
+                    }),
+                );
+                dlock.callback_server_index += 1;
+                index
             };
             self.internal_iosend(Self::get_packet_write(
                 &WritePacket::RequestPlayerVariable(
@@ -2854,7 +2866,6 @@ impl CrystalServer {
                 let index = if let Some((index, csu)) = dlock
                     .callback_server_update
                     .iter_mut()
-                    .enumerate()
                     .find(|(_, csu)| csu.is_none())
                 {
                     *csu = Some(CallbackServerUpdate {
@@ -2866,11 +2877,12 @@ impl CrystalServer {
                             slot,
                         ),
                     });
-                    index
+                    *index
                 } else {
-                    dlock
-                        .callback_server_update
-                        .push(Some(CallbackServerUpdate {
+                    let index = dlock.callback_server_index;
+                    dlock.callback_server_update.insert(
+                        index,
+                        Some(CallbackServerUpdate {
                             name: name.to_owned(),
                             callback: ServerUpdateCallback::SyncVariable(
                                 callback,
@@ -2878,8 +2890,10 @@ impl CrystalServer {
                                 name.to_owned(),
                                 slot,
                             ),
-                        }));
-                    dlock.callback_server_update.len() - 1
+                        }),
+                    );
+                    dlock.callback_server_index += 1;
+                    index
                 };
                 self.internal_iosend(Self::get_packet_write(&WritePacket::RequestSyncVariable(
                     pid,
@@ -2909,22 +2923,24 @@ impl CrystalServer {
         let index = if let Some((index, csu)) = dlock
             .callback_server_update
             .iter_mut()
-            .enumerate()
             .find(|(_, csu)| csu.is_none())
         {
             *csu = Some(CallbackServerUpdate {
                 name: name.to_owned(),
                 callback: ServerUpdateCallback::FetchBdb(callback, name.to_owned()),
             });
-            index
+            *index
         } else {
-            dlock
-                .callback_server_update
-                .push(Some(CallbackServerUpdate {
+            let index = dlock.callback_server_index;
+            dlock.callback_server_update.insert(
+                index,
+                Some(CallbackServerUpdate {
                     name: name.to_owned(),
                     callback: ServerUpdateCallback::FetchBdb(callback, name.to_owned()),
-                }));
-            dlock.callback_server_update.len() - 1
+                }),
+            );
+            dlock.callback_server_index += 1;
+            index
         };
         self.internal_iosend(Self::get_packet_write(&WritePacket::RequestBdb(
             index as u64,
