@@ -1,6 +1,6 @@
 [package]
 name = "crystal-server"
-version = "1.0.0"
+version = "0.1.0"
 edition = "2021"
 authors = ["ryi3r <ryi3r@duck.com>"]
 
@@ -13,6 +13,9 @@ keywords = ["multiplayer", "service"]
 include = ["LICENSE"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["lib"]
 
 [features]
 default = []
