@@ -32,7 +32,7 @@ tokio = { version = "1.43.0", features = ["net", "rt", "sync", "time"] }
 bytes = "1.10.0"
 futures-util = "0.3.31"
 age = { version = "0.11.1", features = ["async"] }
-machineid-rs = { git = "https://github.com/Crystal-Server/machineid-rs.git", rev = "aab4bad969d2ca084a1aa4905c1e95d40e5ffdb4" }
+machineid-crystal = "1.2.5"
 async-stream = "0.3.6"
 urlencoding = "2.1.3"
 serde = "1.0.217"

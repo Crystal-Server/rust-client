@@ -22,7 +22,7 @@ use futures_util::{
     AsyncReadExt, AsyncWriteExt, SinkExt, Stream, StreamExt,
 };
 use integer_hasher::{IntMap, IntSet};
-use machineid_rs::{Encryption, HWIDComponent, IdBuilder};
+use machineid_crystal::{Encryption, HWIDComponent, IdBuilder};
 use num_enum::TryFromPrimitive;
 use std::{
     collections::{HashMap, HashSet},
