@@ -10,7 +10,7 @@ homepage = "https://crystal-server.co"
 repository = "https://github.com/Crystal-Server/rust-client.git"
 readme = "README.md"
 keywords = ["multiplayer", "service"]
-include = ["LICENSE"]
+include = ["LICENSE", "Cargo.toml", "src/**/*"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
