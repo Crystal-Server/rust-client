@@ -12,14 +12,14 @@ use super::{
     },
 };
 use age::{
-    x25519::{Identity, Recipient},
     Decryptor, Encryptor,
+    x25519::{Identity, Recipient},
 };
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::{
-    stream::{SplitSink, SplitStream},
     AsyncReadExt, AsyncWriteExt, SinkExt, Stream, StreamExt,
+    stream::{SplitSink, SplitStream},
 };
 use integer_hasher::{IntMap, IntSet};
 use machineid_crystal::{Encryption, HWIDComponent, IdBuilder};
@@ -37,7 +37,7 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 #[cfg(feature = "__dev")]
 use tracing::{info, warn};
 
@@ -66,7 +66,7 @@ use tracing::{info, warn};
 /// ```
 /// Or in a single rust task, which is easier to handle:
 /// ```rust
-/// // On a new frame
+/// // On the end of a frame
 /// cs.update().await?;
 /// ```
 /// <div class="warning">
@@ -2040,6 +2040,18 @@ impl CrystalServer {
 
     /// This is the callback when the client receives data from the server or another player.
     /// The function receives 3 arguments: Player ID: [Option<u64>], Message ID: [i64], Payload/Data: [Vec<Value>], and must return nothing.
+    /// ```rust
+    /// cs.callback_set_p2p(|player_id, message_id, payload| {
+    ///     // Your code goes here to handle the event.
+    ///     // For example:
+    ///     const P2P_HELLOWORLD: i16 = 0;
+    ///     if message_id == P2P_HELLOWORLD {
+    ///         if let Some(player_id) = player_id {
+    ///             println!("Hello World, {}!", cs.get_other_player(player_id).unwrap().name);
+    ///         }
+    ///     }
+    /// });
+    /// ```
     pub async fn callback_set_p2p(&self, callback: CallbackP2P) {
         self.data.write().await.func_p2p = Some(callback);
     }

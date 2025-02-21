@@ -3,7 +3,8 @@ pub mod client;
 mod leb;
 pub mod types;
 
-/// This macro provides a natural way to make a [types::Value] while making it readable
+/// This macro provides a natural way to make a [types::Value] while making it readable.
+///
 /// Small sized structures such as [i32] will be converted to their bigger supported structure sizes, [i64].
 /// For integers the type used is [i64]
 /// For floats, [f64]

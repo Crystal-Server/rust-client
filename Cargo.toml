@@ -1,7 +1,7 @@
 [package]
 name = "crystal-server"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["ryi3r <ryi3r@duck.com>"]
 
 license-file = "LICENSE"
@@ -38,4 +38,4 @@ age = { version = "0.11.1", features = ["async"] }
 machineid-crystal = "1.2.5"
 async-stream = "0.3.6"
 urlencoding = "2.1.3"
-serde = "1.0.217"
+serde = "1.0.218"
