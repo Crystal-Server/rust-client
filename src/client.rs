@@ -1,4 +1,4 @@
-use crate::types::NewSync;
+use crate::types::{DisconnectionType, NewSync};
 
 use super::{
     buffer::Buffer,
@@ -98,11 +98,8 @@ struct StreamWriter {
 type CallbackRoom = Box<dyn FnMut() -> String + Sync + Send>;
 type CallbackP2P = Box<dyn FnMut(Option<u64>, i16, Vec<Value>) + Sync + Send>;
 type CallbackRegister = Box<dyn FnMut(RegistrationCode) + Sync + Send>;
-type CallbackLogin = Box<dyn FnMut(LoginCode, Option<DateTime<Utc>>, Option<String>) + Sync + Send>;
-type CallbackBanned = Box<dyn FnMut(String, DateTime<Utc>) + Sync + Send>;
-type CallbackKicked = Box<dyn FnMut(String) + Sync + Send>;
-type CallbackDisconnected = Box<dyn FnMut() + Sync + Send>;
-type CallbackLoginToken = Box<dyn FnMut(String) + Sync + Send>;
+type CallbackLogin = Box<dyn FnMut(LoginCode) + Sync + Send>;
+type CallbackDisconnected = Box<dyn FnMut(DisconnectionType) + Sync + Send>;
 type CallbackDataUpdate = Box<dyn FnMut(DataUpdate) + Sync + Send>;
 
 #[derive(Default)]
@@ -125,10 +122,7 @@ struct StreamData {
     func_p2p: Option<CallbackP2P>,
     func_register: Option<CallbackRegister>,
     func_login: Option<CallbackLogin>,
-    func_banned: Option<CallbackBanned>,
-    func_kicked: Option<CallbackKicked>,
     func_disconnected: Option<CallbackDisconnected>,
-    func_login_token: Option<CallbackLoginToken>,
     func_data_update: Option<CallbackDataUpdate>,
 
     player_id: Option<u64>,
@@ -428,8 +422,8 @@ enum ReadPacket {
     Registration(RegistrationCode),
     /// Login Code
     Login(LoginCode),
-    /// Login Code, Reason, Unban time
-    LoginBan(LoginCode, String, i64),
+    /// Login Code
+    LoginBan(LoginCode),
     /// Player ID, Player Name, Token, Savefile, Friends, Incoming Friends, Outgoing Friends, Game Achievements
     LoginOk(
         u64,
@@ -626,10 +620,10 @@ impl CrystalServer {
                 dlock.clear(true).await;
                 if dlock.call_disconnected {
                     if let Some(func) = dlock.func_disconnected.as_mut() {
-                        func();
+                        func(DisconnectionType::Disconnected);
                     }
                     if let Some(dup) = dlock.func_data_update.as_mut() {
-                        dup(DataUpdate::Disconnected());
+                        dup(DataUpdate::Disconnected);
                     }
                     dlock.call_disconnected = false;
                 }
@@ -784,7 +778,7 @@ impl CrystalServer {
                                 ReadPacket::Login(code) => {
                                     let mut dlock = data.write().await;
                                     if let Some(reg) = &mut dlock.func_login {
-                                        reg(code, None, None);
+                                        reg(code.clone());
                                     }
                                     if let Some(dup) = &mut dlock.func_data_update {
                                         dup(DataUpdate::Login(code));
@@ -813,31 +807,19 @@ impl CrystalServer {
                                         IntSet::from_iter(outgoing_friends.iter().map(|pid| **pid));
                                     dlock.is_loggedin = true;
                                     if let Some(log) = &mut dlock.func_login {
-                                        log(LoginCode::Ok, None, None);
+                                        log(LoginCode::Ok(token.clone()));
                                     }
                                     if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::LoginOk(pid, pname));
-                                    }
-                                    if let Some(token) = token {
-                                        if let Some(log) = &mut dlock.func_login_token {
-                                            log(token.clone());
-                                        }
-                                        if let Some(dup) = &mut dlock.func_data_update {
-                                            dup(DataUpdate::LoginToken(token));
-                                        }
+                                        dup(DataUpdate::LoginOk(pid, pname, token));
                                     }
                                 }
-                                ReadPacket::LoginBan(code, reason, unban_time) => {
+                                ReadPacket::LoginBan(code) => {
                                     let mut dlock = data.write().await;
                                     if let Some(log) = &mut dlock.func_login {
-                                        log(
-                                            code,
-                                            DateTime::from_timestamp(unban_time, 0),
-                                            Some(reason.clone()),
-                                        );
+                                        log(code.clone());
                                     }
                                     if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::LoginBan(code, reason.clone(), unban_time));
+                                        dup(DataUpdate::LoginBan(code));
                                     }
                                 }
                                 ReadPacket::PlayerLoggedIn(pid, pname, vari, syncs, room) => {
@@ -1182,12 +1164,12 @@ impl CrystalServer {
                                     dlock.is_loggedin = false;
                                     match aa.clone() {
                                         AdminAction::Ban(reason, unban_time) => {
-                                            if let Some(callback) = &mut dlock.func_banned {
-                                                callback(
+                                            if let Some(callback) = &mut dlock.func_disconnected {
+                                                callback(DisconnectionType::Banned(
                                                     reason.clone(),
                                                     DateTime::from_timestamp(unban_time, 0)
                                                         .expect("unable to parse ban timestamp"),
-                                                );
+                                                ));
                                             }
                                             if let Some(dup) = dlock.func_data_update.as_mut() {
                                                 dup(DataUpdate::Banned(
@@ -1198,8 +1180,8 @@ impl CrystalServer {
                                             }
                                         }
                                         AdminAction::Kick(reason) => {
-                                            if let Some(callback) = &mut dlock.func_kicked {
-                                                callback(reason.clone());
+                                            if let Some(callback) = &mut dlock.func_disconnected {
+                                                callback(DisconnectionType::Kicked(reason.clone()));
                                             }
                                             if let Some(dup) = dlock.func_data_update.as_mut() {
                                                 dup(DataUpdate::Kicked(reason));
@@ -1381,7 +1363,7 @@ impl CrystalServer {
                                     dlock.is_connecting = true;
                                     dlock.is_reconnecting = true;
                                     if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::Reconnecting());
+                                        dup(DataUpdate::Reconnecting);
                                     }
                                     if let Ok((ws, _)) =
                                         tokio_tungstenite::connect_async(&host).await
@@ -1426,10 +1408,10 @@ impl CrystalServer {
             dlock.clear(true).await;
             if dlock.call_disconnected {
                 if let Some(func) = dlock.func_disconnected.as_mut() {
-                    func();
+                    func(DisconnectionType::Disconnected);
                 }
                 if let Some(dup) = dlock.func_data_update.as_mut() {
-                    dup(DataUpdate::Disconnected());
+                    dup(DataUpdate::Disconnected);
                 }
                 dlock.call_disconnected = false;
             }
@@ -1616,14 +1598,13 @@ impl CrystalServer {
                 Ok(ReadPacket::Registration(code))
             }
             1 => {
-                let code = LoginCode::try_from_primitive(b.read_u8()?).unwrap_or_default();
-                match code {
-                    LoginCode::GameBan => {
+                match b.read_u8()? {
+                    6 /*GameBan*/ | 7 /*GlobalBan*/ => {
                         let reason = b.read_string()?;
                         let unban_time = b.read_i64()?;
-                        Ok(ReadPacket::LoginBan(code, reason, unban_time))
+                        Ok(ReadPacket::LoginBan(LoginCode::GameBan(reason, DateTime::from_timestamp(unban_time, 0).unwrap_or_default())))
                     }
-                    LoginCode::Ok => {
+                    0 /*Ok*/ => {
                         let pid = b.read_leb_u64()?;
                         let name = b.read_string()?;
                         let token = b.read()?;
@@ -1643,7 +1624,13 @@ impl CrystalServer {
                             achievements,
                         ))
                     }
-                    _ => Ok(ReadPacket::Login(code)),
+                    1 /*NoUser*/ => Ok(ReadPacket::Login(LoginCode::NoUser)),
+                    2 /*WrongPassword*/ => Ok(ReadPacket::Login(LoginCode::WrongPassword)),
+                    3 /*Unauthenticated*/ => Ok(ReadPacket::Login(LoginCode::Unauthenticated)),
+                    4 /*Unverified*/ => Ok(ReadPacket::Login(LoginCode::Unverified)),
+                    5 /*AlreadyIn*/ => Ok(ReadPacket::Login(LoginCode::AlreadyIn)),
+                    9 /*MaxPlayers*/ => Ok(ReadPacket::Login(LoginCode::MaxPlayers)),
+                    _ /*Error & any other wrong value*/ => Ok(ReadPacket::Login(LoginCode::Error)),
                 }
             }
             2 => {
@@ -2008,8 +1995,14 @@ impl CrystalServer {
                 if ping.elapsed().as_secs_f64() >= 90.0 {
                     drop(dlock);
                     self.disconnect().await;
-                    if let Some(dup) = self.data.write().await.func_data_update.as_mut() {
-                        dup(DataUpdate::Disconnected());
+                    {
+                        let mut dlock = self.data.write().await;
+                        if let Some(func) = dlock.func_disconnected.as_mut() {
+                            func(DisconnectionType::Disconnected);
+                        }
+                        if let Some(dup) = dlock.func_data_update.as_mut() {
+                            dup(DataUpdate::Disconnected);
+                        }
                     }
                 }
             }
@@ -2056,43 +2049,10 @@ impl CrystalServer {
         self.data.write().await.func_p2p = Some(callback);
     }
 
-    /// This is the callback when a registration event has been carried out.
-    /// The function receives 1 argument: Result: [RegistrationCode], and must return nothing.
-    pub async fn callback_set_register(&self, callback: CallbackRegister) {
-        self.data.write().await.func_register = Some(callback);
-    }
-
-    /// This is the callback when a login event has been carried out.
-    /// The function receives 1 argument: Result: [LoginCode], and must return nothing.
-    pub async fn callback_set_login(&self, callback: CallbackLogin) {
-        self.data.write().await.func_login = Some(callback);
-    }
-
-    /// This is the callback when the player has been banned while playing.
-    /// The function receives 2 arguments: Reason: [String], Unban Time: [DateTime<Utc>], and must return nothing.
-    pub async fn callback_set_banned(&self, callback: CallbackBanned) {
-        self.data.write().await.func_banned = Some(callback);
-    }
-
-    /// This is the callback when the player has been kicked while playing.
-    /// The function receives 2 arguments: Reason: [String], and must return nothing.
-    pub async fn callback_set_kicked(&self, callback: CallbackKicked) {
-        self.data.write().await.func_kicked = Some(callback);
-    }
-
     /// This is the callback when the client has disconnected from the server.
-    /// The function receives 0 arguments and must return nothing.
+    /// The function receives 1 argument: [DisconnectionType] and must return nothing.
     pub async fn callback_set_disconnected(&self, callback: CallbackDisconnected) {
         self.data.write().await.func_disconnected = Some(callback);
-    }
-
-    /// This is the callback when the client has disconnected from the server.
-    /// The function receives 0 arguments and must return nothing.
-    ///
-    /// The login-token is only valid once and only works for the game it was
-    /// generated on.
-    pub async fn callback_set_login_token(&self, callback: CallbackLoginToken) {
-        self.data.write().await.func_login_token = Some(callback);
     }
 
     /// This is the callback when an event has been triggered by the server.
@@ -2154,21 +2114,25 @@ impl CrystalServer {
 
     async fn internal_iosend(&self, data: Buffer) -> IoResult<()> {
         if let Some(writer) = &self.writer {
-            if let Err(_e) = writer.lock().await.write(data).await {
-                #[cfg(feature = "__dev")]
-                info!("unable to send data to server with error: {_e:?}");
-                let mut dlock = self.data.write().await;
-                dlock.clear(true).await;
-                if dlock.call_disconnected {
-                    if let Some(func) = dlock.func_disconnected.as_mut() {
-                        func();
+            let writer = writer.clone();
+            let sdata = self.data.clone();
+            tokio::spawn(async move {
+                if let Err(_e) = writer.lock().await.write(data).await {
+                    #[cfg(feature = "__dev")]
+                    info!("unable to send data to server with error: {_e:?}");
+                    let mut dlock = sdata.write().await;
+                    dlock.clear(true).await;
+                    if dlock.call_disconnected {
+                        if let Some(func) = dlock.func_disconnected.as_mut() {
+                            func(DisconnectionType::Disconnected);
+                        }
+                        if let Some(dup) = dlock.func_data_update.as_mut() {
+                            dup(DataUpdate::Disconnected);
+                        }
+                        dlock.call_disconnected = false;
                     }
-                    if let Some(dup) = dlock.func_data_update.as_mut() {
-                        dup(DataUpdate::Disconnected());
-                    }
-                    dlock.call_disconnected = false;
                 }
-            }
+            });
         } else {
             #[cfg(feature = "__dev")]
             info!("stream is not open for writing");
@@ -2196,7 +2160,13 @@ impl CrystalServer {
     /// The login result will be sent as a callback event.
     /// Use [CrystalServer::callback_set_login] and [CrystalServer::callback_set_login_token]
     /// respectively to obtain data from the login attempt.
-    pub async fn login(&self, username: &str, passw: &str) -> IoResult<()> {
+    pub async fn login(
+        &self,
+        username: &str,
+        passw: &str,
+        callback: Option<CallbackLogin>,
+    ) -> IoResult<()> {
+        self.data.write().await.func_login = callback;
         self.internal_login(username, LoginPassw::Passw(passw.to_owned()))
             .await
     }
@@ -2206,7 +2176,13 @@ impl CrystalServer {
     /// The login result will be sent as a callback event.
     /// Use [CrystalServer::callback_set_login] and [CrystalServer::callback_set_login_token]
     /// respectively to obtain data from the login attempt.
-    pub async fn login_with_token(&self, username: &str, token: &str) -> IoResult<()> {
+    pub async fn login_with_token(
+        &self,
+        username: &str,
+        token: &str,
+        callback: Option<CallbackLogin>,
+    ) -> IoResult<()> {
+        self.data.write().await.func_login = callback;
         self.internal_login(username, LoginPassw::Token(token.to_owned()))
             .await
     }
@@ -2221,7 +2197,9 @@ impl CrystalServer {
         email: &str,
         passw: &str,
         repeat_passw: &str,
+        callback: Option<CallbackRegister>,
     ) -> IoResult<()> {
+        self.data.write().await.func_register = callback;
         self.internal_iosend(Self::get_packet_write(&WritePacket::Register(
             username.to_owned(),
             email.to_owned(),

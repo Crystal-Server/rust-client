@@ -133,10 +133,10 @@ pub enum DataUpdate {
     Registration(RegistrationCode),
     /// Return Code
     Login(LoginCode),
-    /// Player ID, Player Name
-    LoginOk(u64, String),
-    /// Return Code, Reason, Unix unban time
-    LoginBan(LoginCode, String, i64),
+    /// Player ID, Player Name, Login Token
+    LoginOk(u64, String, Option<String>),
+    /// Return Code
+    LoginBan(LoginCode),
     /// Player ID, Player Name, Room
     PlayerLoggedIn(u64, String, String),
     /// Player ID
@@ -165,16 +165,14 @@ pub enum DataUpdate {
     ChangeFriendStatus(u64),
     /// Message
     ServerMessage(String),
-    Reconnecting(),
-    Disconnected(),
+    Reconnecting,
+    Disconnected,
     /// Reason
     Kicked(String),
-    /// Reason, Unban Unix Time
+    /// Reason, Unban Time
     Banned(String, DateTime<Utc>),
     /// Notification Message
     ServerNotification(String),
-    /// Login Token
-    LoginToken(String),
 }
 
 /// The return success value of a registration attempt
@@ -198,17 +196,17 @@ pub enum RegistrationCode {
 }
 
 /// The return success value of a login attempt
-#[derive(Default, Copy, Clone, Debug, TryFromPrimitive, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum LoginCode {
-    Ok = 0,
+    Ok(Option<String>) = 0,
     NoUser = 1,
     WrongPassword = 2,
     Unauthenticated = 3,
     Unverified = 4,
     AlreadyIn = 5,
-    GameBan = 6,
-    GlobalBan = 7,
+    GameBan(String, DateTime<Utc>) = 6,
+    GlobalBan(String, DateTime<Utc>) = 7,
     #[default]
     Error = 8,
     MaxPlayers = 9,
@@ -263,6 +261,20 @@ pub(crate) struct SyncUpdate {
 pub enum OptionalValue {
     Some(Value),
     None,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DisconnectionType {
+    /// Triggers whenever the client disconnect for whatever reason
+    Disconnected,
+    /// This actually doesn't disconnect the game, but does logout the player.<br>
+    /// This will only happen when an admin kicks the player.<br>
+    /// The String is the Reason of the kick.
+    Kicked(String),
+    /// This actually doesn't disconnect the game, but does logout the player.<br>
+    /// This will only happen when an admin bans the player.
+    /// The String is the Reason of the kick, the DateTime<Utc> is when the player will be unbanned.
+    Banned(String, DateTime<Utc>),
 }
 
 /// An object that's being synced between players
