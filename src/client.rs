@@ -25,17 +25,21 @@ use integer_hasher::{IntMap, IntSet};
 use machineid_crystal::{Encryption, HWIDComponent, IdBuilder};
 use num_enum::TryFromPrimitive;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::{Cursor, Error, ErrorKind, Result as IoResult},
     iter,
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 use tokio::{
     net::TcpStream,
-    sync::{Mutex, RwLock},
+    sync::{
+        Mutex, RwLock,
+        mpsc::{self, UnboundedSender},
+    },
     task::JoinHandle,
-    time::Instant,
+    time::{self, Instant},
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 #[cfg(feature = "__dev")]
@@ -105,6 +109,7 @@ type CallbackDataUpdate = Box<dyn FnMut(DataUpdate) + Sync + Send>;
 #[derive(Default)]
 struct StreamData {
     thread: Option<JoinHandle<()>>,
+    write_mpsc: Option<UnboundedSender<WritePacket>>, // todo: finish this shit i'm lazy rn lol
     last_host: Option<String>,
 
     is_connected: bool,
@@ -140,7 +145,7 @@ struct StreamData {
     game_administrators: IntMap<Leb<u64>, Administrator>,
     game_version: f64,
 
-    pub players: IntMap<u64, Player>,
+    players: IntMap<u64, Player>,
     players_logout: IntSet<u64>,
     player_queue: IntMap<u64, PlayerQueue>,
     variables: HashMap<String, Value>,
@@ -497,6 +502,8 @@ enum ReadPacket {
     ServerMessage(String),
     /// Target Host
     ChangeConnection(String),
+    /// Packets
+    PacketCrunch(Vec<ReadPacket>),
 }
 
 #[derive(Debug, Clone)]
@@ -553,6 +560,8 @@ enum WritePacket {
     RequestChangeFriendStatus(ChangeFriendStatus, u64),
     /// Key
     Handshake(String),
+    /// Packets
+    PacketCrunch(Vec<WritePacket>),
 }
 
 impl CrystalServer {
@@ -659,731 +668,771 @@ impl CrystalServer {
                 };
             }
 
+            let (write_mpsc, mut read_mpsc) = mpsc::unbounded_channel();
+            data.write().await.write_mpsc = Some(write_mpsc);
+            let send_timeout = time::sleep(Duration::from_nanos(1));
+            tokio::pin!(send_timeout);
+            let mut send_packets = Vec::new();
+
             #[cfg(feature = "__dev")]
             info!("Initialized stream handle task");
 
             loop {
-                match reader.read().await {
-                    Ok(mut buffer) => {
-                        if buffer.is_empty()? {
-                            continue;
-                        }
-                        if let Ok(packet) = CrystalServer::get_packet_read(buffer) {
+                tokio::select! {
+                    message = read_mpsc.recv() => {
+                        if let Some(message) = message {
+                            send_packets.push(message);
+                            send_timeout.set(time::sleep(Duration::from_millis(1)));
+                        } else {
                             #[cfg(feature = "__dev")]
-                            info!("reading packet: {packet:?}");
-                            match packet {
-                                ReadPacket::Handshake(key) => {
-                                    if let Some(key) = key {
-                                        let encode_read = Identity::generate();
-                                        let encodepub_read = encode_read.to_public();
-                                        reader.identity = Some(encode_read);
-                                        match Recipient::from_str(&key) {
-                                            Ok(key) => {
-                                                {
-                                                    let mut dlock = data.write().await;
-                                                    dlock.is_connecting = false;
-                                                    dlock.is_reconnecting = false;
-                                                    dlock.is_connected = true;
-                                                }
-                                                writer.lock().await.recipient = Some(key);
-                                            }
-                                            Err(_e) => {
-                                                #[cfg(feature = "__dev")]
-                                                warn!("error while parsing key: {_e:?}");
-                                                {
-                                                    let mut dlock = data.write().await;
-                                                    dlock.clear(true).await;
-                                                    dlock.registered_errors.push(
-                                                        ClientError::HandlerResultString(String::from(
-                                                            "unable to set write key for data writer",
-                                                        )),
-                                                    );
-                                                }
-                                                return Ok(());
-                                            }
-                                        }
-                                        write_packet!(WritePacket::Handshake(
-                                            encodepub_read.to_string(),
-                                        ));
-                                    } else {
-                                        let hwid = if let Ok(hwid) =
-                                            IdBuilder::new(Encryption::SHA256)
-                                                .add_component(HWIDComponent::CPUID)
-                                                .add_component(HWIDComponent::MacAddress)
-                                                .add_component(HWIDComponent::SystemID)
-                                                .build(None)
-                                        {
-                                            hwid
-                                        } else {
-                                            return Err(Error::from(ErrorKind::InvalidData));
-                                        };
-                                        let dlock = data.read().await;
-                                        write_packet!(WritePacket::InitializationHandshake(
-                                            [
-                                                0x3a0b1a04c51a2811,
-                                                0x97a18f1dc9ee891d,
-                                                0xfc7eb64f732a37fd,
-                                                0xbe65cbabde15c305,
-                                            ],
-                                            1,
-                                            hwid,
-                                            dlock.game_id.clone(),
-                                            dlock.version,
-                                            dlock.session.clone()
-                                        ));
-                                    }
-                                }
-                                ReadPacket::SyncGameInfo(
-                                    game_save,
-                                    game_achievements,
-                                    game_highscores,
-                                    game_administrators,
-                                    game_version,
-                                ) => {
-                                    let mut dlock = data.write().await;
-                                    dlock.game_save = game_save;
-                                    dlock.game_achievements = game_achievements;
-                                    dlock.game_highscores = game_highscores;
-                                    dlock.game_administrators = game_administrators;
-                                    dlock.game_version = game_version;
-                                    dlock.handshake_completed = true;
-                                }
-                                ReadPacket::Ping(ping) => {
-                                    if let Some(ping) = ping {
-                                        let mut dlock = data.write().await;
-                                        dlock.ping = ping;
-                                        dlock.last_ping = Some(Instant::now());
-                                    } else {
-                                        {
-                                            write_packet!(WritePacket::Ping());
-                                        }
-                                        writer.lock().await.write_pong().await?;
-                                    }
-                                }
-                                ReadPacket::ForceDisconnection() => {
-                                    return Err(Error::new(
-                                        ErrorKind::BrokenPipe,
-                                        "forced disconnection registered",
-                                    ));
-                                }
-                                ReadPacket::Registration(code) => {
-                                    let mut dlock = data.write().await;
-                                    if let Some(reg) = &mut dlock.func_register {
-                                        reg(code);
-                                    }
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::Registration(code));
-                                    }
-                                }
-                                ReadPacket::Login(code) => {
-                                    let mut dlock = data.write().await;
-                                    if let Some(reg) = &mut dlock.func_login {
-                                        reg(code.clone());
-                                    }
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::Login(code));
-                                    }
-                                }
-                                ReadPacket::LoginOk(
-                                    pid,
-                                    pname,
-                                    token,
-                                    savefile,
-                                    friends,
-                                    incoming_friends,
-                                    outgoing_friends,
-                                    game_achievements,
-                                ) => {
-                                    let mut dlock = data.write().await;
-                                    dlock.player_id = Some(pid);
-                                    dlock.player_name = Some(pname.clone());
-                                    dlock.player_save = savefile;
-                                    dlock.game_achievements = game_achievements;
-                                    dlock.player_friends =
-                                        IntSet::from_iter(friends.iter().map(|pid| **pid));
-                                    dlock.player_incoming_friends =
-                                        IntSet::from_iter(incoming_friends.iter().map(|pid| **pid));
-                                    dlock.player_outgoing_friends =
-                                        IntSet::from_iter(outgoing_friends.iter().map(|pid| **pid));
-                                    dlock.is_loggedin = true;
-                                    if let Some(log) = &mut dlock.func_login {
-                                        log(LoginCode::Ok(token.clone()));
-                                    }
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::LoginOk(pid, pname, token));
-                                    }
-                                }
-                                ReadPacket::LoginBan(code) => {
-                                    let mut dlock = data.write().await;
-                                    if let Some(log) = &mut dlock.func_login {
-                                        log(code.clone());
-                                    }
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::LoginBan(code));
-                                    }
-                                }
-                                ReadPacket::PlayerLoggedIn(pid, pname, vari, syncs, room) => {
-                                    let mut dlock = data.write().await;
-                                    dlock.players.insert(
-                                        pid,
-                                        Player {
-                                            name: pname.clone(),
-                                            room: room.clone(),
-                                            syncs,
-                                            variables: vari,
-                                        },
-                                    );
-                                    Self::iter_missing_data(&mut dlock, pid).await?;
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::PlayerLoggedIn(pid, pname, room));
-                                    }
-                                }
-                                ReadPacket::PlayerLoggedOut(pid) => {
-                                    let mut dlock = data.write().await;
-                                    dlock.players.remove(&pid);
-                                    dlock.player_queue.remove(&pid);
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::PlayerLoggedOut(pid));
-                                    }
-                                }
-                                ReadPacket::P2P(pid, mid, payload) => {
-                                    let mut dlock = data.write().await;
-                                    if let Some(p2p) = &mut dlock.func_p2p {
-                                        p2p(pid.map(|v| *v), mid, payload.clone());
-                                    }
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::P2P(pid.map(|v| *v), mid, payload));
-                                    }
-                                }
-                                ReadPacket::UpdatePlayerVariable(pid, upds) => {
-                                    let mut dlock = data.write().await;
-                                    Self::iter_missing_data(&mut dlock, pid).await?;
-                                    if let Some(player) = dlock.players.get_mut(&pid) {
-                                        for upd in &upds {
-                                            if let OptionalValue::Some(value) = upd.value.clone() {
-                                                player
-                                                    .variables
-                                                    .insert(upd.name.clone(), value.clone());
-                                            } else {
-                                                player.variables.remove(&upd.name);
-                                            }
-                                        }
-                                        for upd in upds {
-                                            if let Some(dup) = &mut dlock.func_data_update {
-                                                dup(DataUpdate::UpdateVariable(
-                                                    pid, upd.name, upd.value,
-                                                ));
-                                            }
-                                        }
-                                    } else {
-                                        if !dlock.player_queue.contains_key(&pid) {
-                                            dlock
-                                                .player_queue
-                                                .entry(pid)
-                                                .or_insert(PlayerQueue::default());
-                                        }
-                                        let pq = dlock
-                                            .player_queue
-                                            .get_mut(&pid)
-                                            .expect("expected to have data stored");
-                                        for upd in upds {
-                                            pq.variables.insert(upd.name, upd.value);
-                                        }
-                                    }
-                                }
-                                ReadPacket::UpdateSync(pid, upds) => {
-                                    // There's surely a better way to do this, more performantly.
-                                    let mut dlock = data.write().await;
-                                    Self::iter_missing_data(&mut dlock, pid).await?;
-                                    let mut exists = IntSet::default();
-                                    let mut add_pq = IntSet::default();
-                                    #[cfg(feature = "__dev")]
-                                    info!("UpdateSync >>> {pid:?},{upds:?}");
-                                    if let Some(player) = dlock.players.get_mut(&pid) {
-                                        #[cfg(feature = "__dev")]
-                                        info!("Got Player");
-                                        for upd in &upds {
-                                            #[cfg(feature = "__dev")]
-                                            info!("Iterating over update {upd:?}");
-                                            if let Some(Some(sync)) = player.syncs.get_mut(upd.slot)
-                                            {
-                                                #[cfg(feature = "__dev")]
-                                                info!("Got sync {sync:?}");
-                                                exists.insert(upd.slot);
-                                                if let Some(vari) = &upd.variables {
-                                                    #[cfg(feature = "__dev")]
-                                                    info!("Got variable updates: {vari:?}");
-                                                    for (vname, value) in vari {
-                                                        #[cfg(feature = "__dev")]
-                                                        info!(
-                                                            "Itering over {vname:?} >>> {value:?}"
-                                                        );
-                                                        if let OptionalValue::Some(value) =
-                                                            value.clone()
-                                                        {
-                                                            #[cfg(feature = "__dev")]
-                                                            info!("Set");
-                                                            sync.variables
-                                                                .insert(vname.clone(), value);
-                                                        } else {
-                                                            #[cfg(feature = "__dev")]
-                                                            info!("Removed");
-                                                            sync.variables.remove(vname);
-                                                        }
-                                                    }
-                                                } else if upd.remove_sync {
-                                                    #[cfg(feature = "__dev")]
-                                                    info!("Marked as sync is ending");
-                                                    sync.is_ending = true;
-                                                } else {
-                                                    #[cfg(feature = "__dev")]
-                                                    info!("No updates triggered");
-                                                }
-                                                #[cfg(feature = "__dev")]
-                                                info!("Finished iterating over sync {sync:?}");
-                                            } else {
-                                                #[cfg(feature = "__dev")]
-                                                info!("Added sync to PlayerQueue");
-                                                add_pq.insert(pid);
-                                            }
-                                        }
-                                    } else {
-                                        #[cfg(feature = "__dev")]
-                                        info!("Added to PlayerQueue");
-                                        add_pq.insert(pid);
-                                    }
-                                    for slot in exists {
-                                        if let Some(upd) =
-                                            upds.iter().find(|supd| supd.slot == slot)
-                                        {
-                                            if let Some(dup) = &mut dlock.func_data_update {
-                                                if let Some(vari) = &upd.variables {
-                                                    for (vname, value) in vari {
-                                                        dup(DataUpdate::UpdateSyncVariable(
-                                                            pid,
-                                                            slot,
-                                                            vname.clone(),
-                                                            value.clone(),
-                                                        ));
-                                                    }
-                                                } else if upd.remove_sync {
-                                                    dup(DataUpdate::UpdateSyncRemoval(pid, slot));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    for pid in add_pq {
-                                        for upd in &upds {
-                                            if let Some(player) = dlock.players.get(&pid) {
-                                                if let Some(Some(_)) = player.syncs.get(upd.slot) {
-                                                    continue;
-                                                }
-                                            }
-                                            dlock
-                                                .player_queue
-                                                .entry(pid)
-                                                .or_insert(PlayerQueue::default());
-                                            let pq = dlock
-                                                .player_queue
-                                                .get_mut(&pid)
-                                                .expect("expected to have data stored");
-                                            if let Some(vari) = &upd.variables {
-                                                pq.syncs.entry(upd.slot).or_insert(HashMap::new());
-                                                let su = pq
-                                                    .syncs
-                                                    .get_mut(&upd.slot)
-                                                    .expect("expected to have data stored");
-                                                for (vname, value) in vari {
-                                                    su.insert(vname.clone(), value.clone());
-                                                }
-                                            } else if upd.remove_sync
-                                                && !pq.remove_syncs.contains(&upd.slot)
-                                            {
-                                                pq.remove_syncs.push(upd.slot);
-                                            }
-                                        }
-                                    }
-                                }
-                                ReadPacket::ClearPlayers() => {
-                                    let mut dlock = data.write().await;
-                                    for pid in dlock.players.keys().cloned().collect::<Vec<u64>>() {
-                                        if let Some(dup) = &mut dlock.func_data_update {
-                                            dup(DataUpdate::PlayerLoggedOut(pid));
-                                        }
-                                    }
-                                    dlock.players.clear();
-                                }
-                                ReadPacket::GameIniWrite(upds) => {
-                                    let mut dlock = data.write().await;
-                                    for upd in upds {
-                                        if let OptionalValue::Some(value) = upd.value.clone() {
-                                            dlock.game_save.insert(upd.name.clone(), value.clone());
-                                        } else {
-                                            dlock.game_save.remove(&upd.name);
-                                        }
-                                        if let Some(dup) = &mut dlock.func_data_update {
-                                            let keys = upd
-                                                .name
-                                                .split(">")
-                                                .map(|entry| {
-                                                    urlencoding::decode(entry).expect(
-                                                        "unable to decode uri on gameini update",
-                                                    )
-                                                })
-                                                .collect::<Vec<_>>();
-                                            if keys.len() == 3 {
-                                                dup(DataUpdate::UpdateGameIni(
-                                                    Some(
-                                                        keys.first()
-                                                            .expect("unable to fetch key 0")
-                                                            .to_string(),
-                                                    ),
-                                                    keys.get(1)
-                                                        .expect("unable to fetch key 1")
-                                                        .to_string(),
-                                                    keys.get(2)
-                                                        .expect("unable to fetch key 2")
-                                                        .to_string(),
-                                                    upd.value,
-                                                ));
-                                            } else {
-                                                dup(DataUpdate::UpdateGameIni(
-                                                    None,
-                                                    keys.first()
-                                                        .expect("unable to fetch key 0 on empty")
-                                                        .to_string(),
-                                                    keys.get(1)
-                                                        .expect("unable to fetch key 1 on empty")
-                                                        .to_string(),
-                                                    upd.value,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                                ReadPacket::NewSync(pid, upds) => {
-                                    let mut dlock = data.write().await;
-                                    for (slot, kind, stype, vari) in upds {
-                                        if let Some(player) = dlock.players.get_mut(&pid) {
-                                            player.syncs.insert(
-                                                slot as usize,
-                                                Some(types::Sync {
-                                                    kind,
-                                                    sync_type: stype,
-                                                    variables: vari,
-                                                    event: SyncEvent::New,
-                                                    is_ending: false,
-                                                }),
-                                            );
-                                            Self::iter_missing_data(&mut dlock, pid).await?;
-                                        } else {
-                                            dlock
-                                                .player_queue
-                                                .entry(pid)
-                                                .or_insert(PlayerQueue::default());
-                                            let pq = dlock
-                                                .player_queue
-                                                .get_mut(&pid)
-                                                .expect("expected to have data stored");
-                                            pq.new_syncs.push(NewSync {
-                                                kind,
-                                                slot: slot as usize,
-                                                sync_type: stype,
-                                                variables: vari,
-                                            });
-                                        }
-                                    }
-                                }
-                                ReadPacket::PlayerChangedRooms(pid, room) => {
-                                    let mut dlock = data.write().await;
-                                    Self::iter_missing_data(&mut dlock, pid).await?;
-                                    if let Some(player) = dlock.players.get_mut(&pid) {
-                                        player.room = room;
-                                    }
-                                }
-                                ReadPacket::HighscoreUpdate(pid, hid, score) => {
-                                    let mut dlock = data.write().await;
-                                    if let Some(highscore) =
-                                        dlock.game_highscores.get_mut(&Leb(hid))
-                                    {
-                                        highscore.scores.insert(Leb(pid), score);
-                                    }
-                                }
-                                ReadPacket::UpdatePlayerData(pid, syncs, vari) => {
-                                    let mut dlock = data.write().await;
-                                    #[cfg(feature = "__dev")]
-                                    info!("{pid:?}, {syncs:?}, {vari:?}");
-                                    if dlock.players.contains_key(&pid) {
-                                        #[cfg(feature = "__dev")]
-                                        info!("OK");
-                                        dlock.player_queue.remove(&pid);
-                                        if let Some(player) = dlock.players.get_mut(&pid) {
-                                            player.syncs = syncs;
-                                            player.variables = vari;
-                                            #[cfg(feature = "__dev")]
-                                            info!("{player:?}");
-                                        }
-                                    }
-                                    #[cfg(feature = "__dev")]
-                                    info!("END");
-                                }
-                                ReadPacket::RequestPlayerVariable(index, vari) => {
-                                    let mut dlock = data.write().await;
-                                    #[cfg(feature = "__dev")]
-                                    info!(
-                                        "RequestPlayerVariable->{:?}->{index:?}",
-                                        dlock.callback_server_update
-                                    );
-                                    if let Some(Some(csu)) = dlock
-                                        .callback_server_update
-                                        .get_mut(&index)
-                                        .map(|csu| csu.take())
-                                    {
-                                        if let ServerUpdateCallback::PlayerVariable(callback, pid) =
-                                            csu.callback
-                                        {
-                                            Self::iter_missing_data(&mut dlock, pid).await?;
-                                            if let Some(player) = dlock.players.get_mut(&pid) {
-                                                if let OptionalValue::Some(value) = vari.clone() {
-                                                    player
-                                                        .variables
-                                                        .insert(csu.name.clone(), value);
-                                                } else {
-                                                    player.variables.remove(&*csu.name);
-                                                }
-                                            }
-                                            if let Some(mut callback) = callback {
-                                                callback(pid, csu.name, vari);
-                                            }
-                                        }
-                                    }
-                                }
-                                ReadPacket::AdminAction(aa) => {
-                                    let mut dlock = data.write().await;
-                                    dlock.clear(false).await;
-                                    dlock.is_loggedin = false;
-                                    match aa.clone() {
-                                        AdminAction::Ban(reason, unban_time) => {
-                                            if let Some(callback) = &mut dlock.func_disconnected {
-                                                callback(DisconnectionType::Banned(
-                                                    reason.clone(),
-                                                    DateTime::from_timestamp(unban_time, 0)
-                                                        .expect("unable to parse ban timestamp"),
-                                                ));
-                                            }
-                                            if let Some(dup) = dlock.func_data_update.as_mut() {
-                                                dup(DataUpdate::Banned(
-                                                    reason,
-                                                    DateTime::from_timestamp(unban_time, 0)
-                                                        .expect("unable to parse ban timestamp"),
-                                                ));
-                                            }
-                                        }
-                                        AdminAction::Kick(reason) => {
-                                            if let Some(callback) = &mut dlock.func_disconnected {
-                                                callback(DisconnectionType::Kicked(reason.clone()));
-                                            }
-                                            if let Some(dup) = dlock.func_data_update.as_mut() {
-                                                dup(DataUpdate::Kicked(reason));
-                                            }
-                                        }
-                                        AdminAction::Unban => {
-                                            panic!("this should never happen");
-                                        }
-                                    }
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::AdminAction(aa));
-                                    }
-                                }
-                                ReadPacket::RequestSyncVariable(index, vari) => {
-                                    let mut dlock = data.write().await;
-                                    if let Some(Some(csu)) =
-                                        dlock.callback_server_update.remove(&index)
-                                    {
-                                        if let ServerUpdateCallback::SyncVariable(
-                                            callback,
-                                            pid,
-                                            slot,
-                                        ) = csu.callback
-                                        {
-                                            let obtained = if let Some(player) =
-                                                dlock.players.get_mut(&pid)
-                                            {
-                                                if let Some(Some(sync)) = player.syncs.get_mut(slot)
-                                                {
-                                                    if let OptionalValue::Some(value) = vari.clone()
-                                                    {
-                                                        sync.variables
-                                                            .insert(csu.name.clone(), value);
-                                                    } else {
-                                                        sync.variables.remove(&*csu.name);
-                                                    }
-                                                }
-                                                true
-                                            } else {
-                                                false
-                                            };
-                                            if obtained {
-                                                if let Some(dup) = &mut dlock.func_data_update {
-                                                    dup(DataUpdate::UpdateSyncVariable(
-                                                        pid,
-                                                        slot,
-                                                        csu.name.clone(),
-                                                        vari.clone(),
-                                                    ));
-                                                }
-                                            }
-                                            if let Some(mut callback) = callback {
-                                                callback(pid, csu.name, vari);
-                                            }
-                                        }
-                                    }
-                                }
-                                ReadPacket::ChangeGameVersion(ver) => {
-                                    let mut dlock = data.write().await;
-                                    dlock.game_version = ver;
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::UpdateGameVersion(ver));
-                                    }
-                                }
-                                ReadPacket::ModifyAdministrator(pid, admin) => {
-                                    let mut dlock = data.write().await;
-                                    dlock.game_administrators.insert(Leb(pid), admin);
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::UpdateAdministrator(pid, Some(admin)));
-                                    }
-                                }
-                                ReadPacket::RemoveAdministrator(pid) => {
-                                    let mut dlock = data.write().await;
-                                    dlock.game_administrators.remove(&Leb(pid));
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::UpdateAdministrator(pid, None));
-                                    }
-                                }
-                                ReadPacket::PlayerIniWrite(upds) => {
-                                    let mut dlock = data.write().await;
-                                    for upd in upds {
-                                        if let OptionalValue::Some(value) = upd.value.clone() {
-                                            dlock.game_save.insert(upd.name.clone(), value.clone());
-                                        } else {
-                                            dlock.game_save.remove(&upd.name);
-                                        }
-                                        if let Some(dup) = &mut dlock.func_data_update {
-                                            let keys = upd
-                                                .name
-                                                .split(">")
-                                                .map(|entry| {
-                                                    urlencoding::decode(entry).expect(
-                                                        "unable to decode uri on playerini update",
-                                                    )
-                                                })
-                                                .collect::<Vec<_>>();
-                                            if keys.len() == 3 {
-                                                dup(DataUpdate::UpdatePlayerIni(
-                                                    Some(
-                                                        keys.first()
-                                                            .expect("unable to fetch key 0")
-                                                            .to_string(),
-                                                    ),
-                                                    keys.get(1)
-                                                        .expect("unable to fetch key 1")
-                                                        .to_string(),
-                                                    keys.first()
-                                                        .expect("unable to fetch key 2")
-                                                        .to_string(),
-                                                    upd.value,
-                                                ));
-                                            } else {
-                                                dup(DataUpdate::UpdatePlayerIni(
-                                                    None,
-                                                    keys.first()
-                                                        .expect("unable to fetch key 0 on empty")
-                                                        .to_string(),
-                                                    keys.get(1)
-                                                        .expect("unable to fetch key 1 on empty")
-                                                        .to_string(),
-                                                    upd.value,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                                ReadPacket::RequestBdb(index, bdb) => {
-                                    let mut dlock = data.write().await;
-                                    if let Some(Some(mut csu)) = dlock
-                                        .callback_server_update
-                                        .get_mut(&index)
-                                        .map(|csu| csu.take())
-                                    {
-                                        if let ServerUpdateCallback::FetchBdb(Some(callback)) =
-                                            &mut csu.callback
-                                        {
-                                            callback(csu.name.clone(), bdb.clone());
-                                        }
-                                        if let Some(dup) = &mut dlock.func_data_update {
-                                            dup(DataUpdate::FetchBdb(csu.name.clone(), bdb));
-                                        }
-                                    }
-                                }
-                                ReadPacket::ChangeFriendStatus(cfs, pid) => {
-                                    let mut dlock = data.write().await;
-                                    // Tl;dr: This is stupid
-                                    match cfs {
-                                        ChangeFriendStatus::Request => {
-                                            dlock.player_incoming_friends.insert(pid);
-                                            dlock.player_friends.remove(&pid);
-                                            dlock.player_outgoing_friends.remove(&pid);
-                                        }
-                                        ChangeFriendStatus::Accept | ChangeFriendStatus::Friend => {
-                                            dlock.player_friends.insert(pid);
-                                            dlock.player_incoming_friends.remove(&pid);
-                                            dlock.player_outgoing_friends.remove(&pid);
-                                        }
-                                        ChangeFriendStatus::Deny
-                                        | ChangeFriendStatus::Cancel
-                                        | ChangeFriendStatus::Remove
-                                        | ChangeFriendStatus::NotFriend => {
-                                            dlock.player_friends.remove(&pid);
-                                            dlock.player_incoming_friends.remove(&pid);
-                                            dlock.player_outgoing_friends.remove(&pid);
-                                        }
-                                    }
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::ChangeFriendStatus(pid));
-                                    }
-                                }
-                                ReadPacket::ServerMessage(msg) => {
-                                    let mut dlock = data.write().await;
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::ServerMessage(msg.clone()));
-                                    }
-                                }
-                                ReadPacket::ChangeConnection(host) => {
-                                    let mut dlock = data.write().await;
-                                    dlock.is_connecting = true;
-                                    dlock.is_reconnecting = true;
-                                    if let Some(dup) = &mut dlock.func_data_update {
-                                        dup(DataUpdate::Reconnecting);
-                                    }
-                                    if let Ok((ws, _)) =
-                                        tokio_tungstenite::connect_async(&host).await
-                                    {
-                                        let (sread, swrite) = StreamHandler::split_stream(ws).await;
-                                        *writer.lock().await = swrite;
-                                        reader = sread;
-                                        dlock.last_host = Some(host);
-                                    } else {
-                                        return Err(Error::new(
-                                            ErrorKind::ConnectionRefused,
-                                            "unable to connect to new host",
-                                        ));
-                                    }
-                                }
+                            info!("read mpsc closed unexpectedly");
+                            return Ok(());
+                        }
+                    }
+                    _ = &mut send_timeout => {
+                        if send_packets.len() >= 5 {
+                            write_packet!(WritePacket::PacketCrunch(std::mem::take(&mut send_packets)));
+                        } else {
+                            for packet in send_packets.drain(..) {
+                                write_packet!(packet);
                             }
                         }
                     }
-                    Err(_e) => {
-                        return Err(Error::new(ErrorKind::BrokenPipe, "invalid read data"));
+                    message = reader.read() => {
+                        match message {
+                            Ok(mut buffer) => {
+                                if buffer.is_empty()? {
+                                    continue;
+                                }
+                                let mut packets = VecDeque::new();
+                                if let Ok(packet) = CrystalServer::get_packet_read(&mut buffer) {
+                                    packets.push_back(packet);
+                                }
+                                while !packets.is_empty() {
+                                    let packet = packets.pop_front().ok_or(Error::new(
+                                        ErrorKind::BrokenPipe,
+                                        "expected to have a packet but found none",
+                                    ))?;
+                                    #[cfg(feature = "__dev")]
+                                    info!("reading packet: {packet:?}");
+                                    match packet {
+                                        ReadPacket::PacketCrunch(rpack) => {
+                                            packets.extend(rpack);
+                                        }
+                                        ReadPacket::Handshake(key) => {
+                                            if let Some(key) = key {
+                                                let encode_read = Identity::generate();
+                                                let encodepub_read = encode_read.to_public();
+                                                reader.identity = Some(encode_read);
+                                                match Recipient::from_str(&key) {
+                                                    Ok(key) => {
+                                                        {
+                                                            let mut dlock = data.write().await;
+                                                            dlock.is_connecting = false;
+                                                            dlock.is_reconnecting = false;
+                                                            dlock.is_connected = true;
+                                                        }
+                                                        writer.lock().await.recipient = Some(key);
+                                                    }
+                                                    Err(_e) => {
+                                                        #[cfg(feature = "__dev")]
+                                                        warn!("error while parsing key: {_e:?}");
+                                                        {
+                                                            let mut dlock = data.write().await;
+                                                            dlock.clear(true).await;
+                                                            dlock.registered_errors.push(
+                                                                ClientError::HandlerResultString(String::from(
+                                                                    "unable to set write key for data writer",
+                                                                )),
+                                                            );
+                                                        }
+                                                        return Ok(());
+                                                    }
+                                                }
+                                                write_packet!(WritePacket::Handshake(
+                                                    encodepub_read.to_string(),
+                                                ));
+                                            } else {
+                                                let hwid = if let Ok(hwid) =
+                                                    IdBuilder::new(Encryption::SHA256)
+                                                        .add_component(HWIDComponent::CPUID)
+                                                        .add_component(HWIDComponent::MacAddress)
+                                                        .add_component(HWIDComponent::SystemID)
+                                                        .build(None)
+                                                {
+                                                    hwid
+                                                } else {
+                                                    return Err(Error::from(ErrorKind::InvalidData));
+                                                };
+                                                let dlock = data.read().await;
+                                                write_packet!(WritePacket::InitializationHandshake(
+                                                    [
+                                                        0x3a0b1a04c51a2811,
+                                                        0x97a18f1dc9ee891d,
+                                                        0xfc7eb64f732a37fd,
+                                                        0xbe65cbabde15c305,
+                                                    ],
+                                                    1,
+                                                    hwid,
+                                                    dlock.game_id.clone(),
+                                                    dlock.version,
+                                                    dlock.session.clone()
+                                                ));
+                                            }
+                                        }
+                                        ReadPacket::SyncGameInfo(
+                                            game_save,
+                                            game_achievements,
+                                            game_highscores,
+                                            game_administrators,
+                                            game_version,
+                                        ) => {
+                                            let mut dlock = data.write().await;
+                                            dlock.game_save = game_save;
+                                            dlock.game_achievements = game_achievements;
+                                            dlock.game_highscores = game_highscores;
+                                            dlock.game_administrators = game_administrators;
+                                            dlock.game_version = game_version;
+                                            dlock.handshake_completed = true;
+                                        }
+                                        ReadPacket::Ping(ping) => {
+                                            if let Some(ping) = ping {
+                                                let mut dlock = data.write().await;
+                                                dlock.ping = ping;
+                                                dlock.last_ping = Some(Instant::now());
+                                            } else {
+                                                {
+                                                    write_packet!(WritePacket::Ping());
+                                                }
+                                                writer.lock().await.write_pong().await?;
+                                            }
+                                        }
+                                        ReadPacket::ForceDisconnection() => {
+                                            return Err(Error::new(
+                                                ErrorKind::BrokenPipe,
+                                                "forced disconnection registered",
+                                            ));
+                                        }
+                                        ReadPacket::Registration(code) => {
+                                            let mut dlock = data.write().await;
+                                            if let Some(reg) = &mut dlock.func_register {
+                                                reg(code);
+                                            }
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::Registration(code));
+                                            }
+                                        }
+                                        ReadPacket::Login(code) => {
+                                            let mut dlock = data.write().await;
+                                            if let Some(reg) = &mut dlock.func_login {
+                                                reg(code.clone());
+                                            }
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::Login(code));
+                                            }
+                                        }
+                                        ReadPacket::LoginOk(
+                                            pid,
+                                            pname,
+                                            token,
+                                            savefile,
+                                            friends,
+                                            incoming_friends,
+                                            outgoing_friends,
+                                            game_achievements,
+                                        ) => {
+                                            let mut dlock = data.write().await;
+                                            dlock.player_id = Some(pid);
+                                            dlock.player_name = Some(pname.clone());
+                                            dlock.player_save = savefile;
+                                            dlock.game_achievements = game_achievements;
+                                            dlock.player_friends =
+                                                IntSet::from_iter(friends.iter().map(|pid| **pid));
+                                            dlock.player_incoming_friends =
+                                                IntSet::from_iter(incoming_friends.iter().map(|pid| **pid));
+                                            dlock.player_outgoing_friends =
+                                                IntSet::from_iter(outgoing_friends.iter().map(|pid| **pid));
+                                            dlock.is_loggedin = true;
+                                            if let Some(log) = &mut dlock.func_login {
+                                                log(LoginCode::Ok(token.clone()));
+                                            }
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::LoginOk(pid, pname, token));
+                                            }
+                                        }
+                                        ReadPacket::LoginBan(code) => {
+                                            let mut dlock = data.write().await;
+                                            if let Some(log) = &mut dlock.func_login {
+                                                log(code.clone());
+                                            }
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::LoginBan(code));
+                                            }
+                                        }
+                                        ReadPacket::PlayerLoggedIn(pid, pname, vari, syncs, room) => {
+                                            let mut dlock = data.write().await;
+                                            dlock.players.insert(
+                                                pid,
+                                                Player {
+                                                    name: pname.clone(),
+                                                    room: room.clone(),
+                                                    syncs,
+                                                    variables: vari,
+                                                },
+                                            );
+                                            Self::iter_missing_data(&mut dlock, pid).await?;
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::PlayerLoggedIn(pid, pname, room));
+                                            }
+                                        }
+                                        ReadPacket::PlayerLoggedOut(pid) => {
+                                            let mut dlock = data.write().await;
+                                            dlock.players.remove(&pid);
+                                            dlock.player_queue.remove(&pid);
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::PlayerLoggedOut(pid));
+                                            }
+                                        }
+                                        ReadPacket::P2P(pid, mid, payload) => {
+                                            let mut dlock = data.write().await;
+                                            if let Some(p2p) = &mut dlock.func_p2p {
+                                                p2p(pid.map(|v| *v), mid, payload.clone());
+                                            }
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::P2P(pid.map(|v| *v), mid, payload));
+                                            }
+                                        }
+                                        ReadPacket::UpdatePlayerVariable(pid, upds) => {
+                                            let mut dlock = data.write().await;
+                                            Self::iter_missing_data(&mut dlock, pid).await?;
+                                            if let Some(player) = dlock.players.get_mut(&pid) {
+                                                for upd in &upds {
+                                                    if let OptionalValue::Some(value) = upd.value.clone() {
+                                                        player
+                                                            .variables
+                                                            .insert(upd.name.clone(), value.clone());
+                                                    } else {
+                                                        player.variables.remove(&upd.name);
+                                                    }
+                                                }
+                                                for upd in upds {
+                                                    if let Some(dup) = &mut dlock.func_data_update {
+                                                        dup(DataUpdate::UpdateVariable(
+                                                            pid, upd.name, upd.value,
+                                                        ));
+                                                    }
+                                                }
+                                            } else {
+                                                if !dlock.player_queue.contains_key(&pid) {
+                                                    dlock
+                                                        .player_queue
+                                                        .entry(pid)
+                                                        .or_insert(PlayerQueue::default());
+                                                }
+                                                let pq = dlock
+                                                    .player_queue
+                                                    .get_mut(&pid)
+                                                    .expect("expected to have data stored");
+                                                for upd in upds {
+                                                    pq.variables.insert(upd.name, upd.value);
+                                                }
+                                            }
+                                        }
+                                        ReadPacket::UpdateSync(pid, upds) => {
+                                            // There's surely a better way to do this, more performantly.
+                                            let mut dlock = data.write().await;
+                                            Self::iter_missing_data(&mut dlock, pid).await?;
+                                            let mut exists = IntSet::default();
+                                            let mut add_pq = IntSet::default();
+                                            #[cfg(feature = "__dev")]
+                                            info!("UpdateSync >>> {pid:?},{upds:?}");
+                                            if let Some(player) = dlock.players.get_mut(&pid) {
+                                                #[cfg(feature = "__dev")]
+                                                info!("Got Player");
+                                                for upd in &upds {
+                                                    #[cfg(feature = "__dev")]
+                                                    info!("Iterating over update {upd:?}");
+                                                    if let Some(Some(sync)) = player.syncs.get_mut(upd.slot)
+                                                    {
+                                                        #[cfg(feature = "__dev")]
+                                                        info!("Got sync {sync:?}");
+                                                        exists.insert(upd.slot);
+                                                        if let Some(vari) = &upd.variables {
+                                                            #[cfg(feature = "__dev")]
+                                                            info!("Got variable updates: {vari:?}");
+                                                            for (vname, value) in vari {
+                                                                #[cfg(feature = "__dev")]
+                                                                info!(
+                                                                    "Itering over {vname:?} >>> {value:?}"
+                                                                );
+                                                                if let OptionalValue::Some(value) =
+                                                                    value.clone()
+                                                                {
+                                                                    #[cfg(feature = "__dev")]
+                                                                    info!("Set");
+                                                                    sync.variables
+                                                                        .insert(vname.clone(), value);
+                                                                } else {
+                                                                    #[cfg(feature = "__dev")]
+                                                                    info!("Removed");
+                                                                    sync.variables.remove(vname);
+                                                                }
+                                                            }
+                                                        } else if upd.remove_sync {
+                                                            #[cfg(feature = "__dev")]
+                                                            info!("Marked as sync is ending");
+                                                            sync.is_ending = true;
+                                                        } else {
+                                                            #[cfg(feature = "__dev")]
+                                                            info!("No updates triggered");
+                                                        }
+                                                        #[cfg(feature = "__dev")]
+                                                        info!("Finished iterating over sync {sync:?}");
+                                                    } else {
+                                                        #[cfg(feature = "__dev")]
+                                                        info!("Added sync to PlayerQueue");
+                                                        add_pq.insert(pid);
+                                                    }
+                                                }
+                                            } else {
+                                                #[cfg(feature = "__dev")]
+                                                info!("Added to PlayerQueue");
+                                                add_pq.insert(pid);
+                                            }
+                                            for slot in exists {
+                                                if let Some(upd) =
+                                                    upds.iter().find(|supd| supd.slot == slot)
+                                                {
+                                                    if let Some(dup) = &mut dlock.func_data_update {
+                                                        if let Some(vari) = &upd.variables {
+                                                            for (vname, value) in vari {
+                                                                dup(DataUpdate::UpdateSyncVariable(
+                                                                    pid,
+                                                                    slot,
+                                                                    vname.clone(),
+                                                                    value.clone(),
+                                                                ));
+                                                            }
+                                                        } else if upd.remove_sync {
+                                                            dup(DataUpdate::UpdateSyncRemoval(pid, slot));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            for pid in add_pq {
+                                                for upd in &upds {
+                                                    if let Some(player) = dlock.players.get(&pid) {
+                                                        if let Some(Some(_)) = player.syncs.get(upd.slot) {
+                                                            continue;
+                                                        }
+                                                    }
+                                                    dlock
+                                                        .player_queue
+                                                        .entry(pid)
+                                                        .or_insert(PlayerQueue::default());
+                                                    let pq = dlock
+                                                        .player_queue
+                                                        .get_mut(&pid)
+                                                        .expect("expected to have data stored");
+                                                    if let Some(vari) = &upd.variables {
+                                                        pq.syncs.entry(upd.slot).or_insert(HashMap::new());
+                                                        let su = pq
+                                                            .syncs
+                                                            .get_mut(&upd.slot)
+                                                            .expect("expected to have data stored");
+                                                        for (vname, value) in vari {
+                                                            su.insert(vname.clone(), value.clone());
+                                                        }
+                                                    } else if upd.remove_sync
+                                                        && !pq.remove_syncs.contains(&upd.slot)
+                                                    {
+                                                        pq.remove_syncs.push(upd.slot);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        ReadPacket::ClearPlayers() => {
+                                            let mut dlock = data.write().await;
+                                            for pid in dlock.players.keys().cloned().collect::<Vec<u64>>() {
+                                                if let Some(dup) = &mut dlock.func_data_update {
+                                                    dup(DataUpdate::PlayerLoggedOut(pid));
+                                                }
+                                            }
+                                            dlock.players.clear();
+                                        }
+                                        ReadPacket::GameIniWrite(upds) => {
+                                            let mut dlock = data.write().await;
+                                            for upd in upds {
+                                                if let OptionalValue::Some(value) = upd.value.clone() {
+                                                    dlock.game_save.insert(upd.name.clone(), value.clone());
+                                                } else {
+                                                    dlock.game_save.remove(&upd.name);
+                                                }
+                                                if let Some(dup) = &mut dlock.func_data_update {
+                                                    let keys = upd
+                                                        .name
+                                                        .split(">")
+                                                        .map(|entry| {
+                                                            urlencoding::decode(entry).expect(
+                                                                "unable to decode uri on gameini update",
+                                                            )
+                                                        })
+                                                        .collect::<Vec<_>>();
+                                                    if keys.len() == 3 {
+                                                        dup(DataUpdate::UpdateGameIni(
+                                                            Some(
+                                                                keys.first()
+                                                                    .expect("unable to fetch key 0")
+                                                                    .to_string(),
+                                                            ),
+                                                            keys.get(1)
+                                                                .expect("unable to fetch key 1")
+                                                                .to_string(),
+                                                            keys.get(2)
+                                                                .expect("unable to fetch key 2")
+                                                                .to_string(),
+                                                            upd.value,
+                                                        ));
+                                                    } else {
+                                                        dup(DataUpdate::UpdateGameIni(
+                                                            None,
+                                                            keys.first()
+                                                                .expect("unable to fetch key 0 on empty")
+                                                                .to_string(),
+                                                            keys.get(1)
+                                                                .expect("unable to fetch key 1 on empty")
+                                                                .to_string(),
+                                                            upd.value,
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        ReadPacket::NewSync(pid, upds) => {
+                                            let mut dlock = data.write().await;
+                                            for (slot, kind, stype, vari) in upds {
+                                                if let Some(player) = dlock.players.get_mut(&pid) {
+                                                    player.syncs.insert(
+                                                        slot as usize,
+                                                        Some(types::Sync {
+                                                            kind,
+                                                            sync_type: stype,
+                                                            variables: vari,
+                                                            event: SyncEvent::New,
+                                                            is_ending: false,
+                                                        }),
+                                                    );
+                                                    Self::iter_missing_data(&mut dlock, pid).await?;
+                                                } else {
+                                                    dlock
+                                                        .player_queue
+                                                        .entry(pid)
+                                                        .or_insert(PlayerQueue::default());
+                                                    let pq = dlock
+                                                        .player_queue
+                                                        .get_mut(&pid)
+                                                        .expect("expected to have data stored");
+                                                    pq.new_syncs.push(NewSync {
+                                                        kind,
+                                                        slot: slot as usize,
+                                                        sync_type: stype,
+                                                        variables: vari,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        ReadPacket::PlayerChangedRooms(pid, room) => {
+                                            let mut dlock = data.write().await;
+                                            Self::iter_missing_data(&mut dlock, pid).await?;
+                                            if let Some(player) = dlock.players.get_mut(&pid) {
+                                                player.room = room;
+                                            }
+                                        }
+                                        ReadPacket::HighscoreUpdate(pid, hid, score) => {
+                                            let mut dlock = data.write().await;
+                                            if let Some(highscore) =
+                                                dlock.game_highscores.get_mut(&Leb(hid))
+                                            {
+                                                highscore.scores.insert(Leb(pid), score);
+                                            }
+                                        }
+                                        ReadPacket::UpdatePlayerData(pid, syncs, vari) => {
+                                            let mut dlock = data.write().await;
+                                            #[cfg(feature = "__dev")]
+                                            info!("{pid:?}, {syncs:?}, {vari:?}");
+                                            if dlock.players.contains_key(&pid) {
+                                                #[cfg(feature = "__dev")]
+                                                info!("OK");
+                                                dlock.player_queue.remove(&pid);
+                                                if let Some(player) = dlock.players.get_mut(&pid) {
+                                                    player.syncs = syncs;
+                                                    player.variables = vari;
+                                                    #[cfg(feature = "__dev")]
+                                                    info!("{player:?}");
+                                                }
+                                            }
+                                            #[cfg(feature = "__dev")]
+                                            info!("END");
+                                        }
+                                        ReadPacket::RequestPlayerVariable(index, vari) => {
+                                            let mut dlock = data.write().await;
+                                            #[cfg(feature = "__dev")]
+                                            info!(
+                                                "RequestPlayerVariable->{:?}->{index:?}",
+                                                dlock.callback_server_update
+                                            );
+                                            if let Some(Some(csu)) = dlock
+                                                .callback_server_update
+                                                .get_mut(&index)
+                                                .map(|csu| csu.take())
+                                            {
+                                                if let ServerUpdateCallback::PlayerVariable(callback, pid) =
+                                                    csu.callback
+                                                {
+                                                    Self::iter_missing_data(&mut dlock, pid).await?;
+                                                    if let Some(player) = dlock.players.get_mut(&pid) {
+                                                        if let OptionalValue::Some(value) = vari.clone() {
+                                                            player
+                                                                .variables
+                                                                .insert(csu.name.clone(), value);
+                                                        } else {
+                                                            player.variables.remove(&*csu.name);
+                                                        }
+                                                    }
+                                                    if let Some(mut callback) = callback {
+                                                        callback(pid, csu.name, vari);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        ReadPacket::AdminAction(aa) => {
+                                            let mut dlock = data.write().await;
+                                            dlock.clear(false).await;
+                                            dlock.is_loggedin = false;
+                                            match aa.clone() {
+                                                AdminAction::Ban(reason, unban_time) => {
+                                                    if let Some(callback) = &mut dlock.func_disconnected {
+                                                        callback(DisconnectionType::Banned(
+                                                            reason.clone(),
+                                                            DateTime::from_timestamp(unban_time, 0)
+                                                                .expect("unable to parse ban timestamp"),
+                                                        ));
+                                                    }
+                                                    if let Some(dup) = dlock.func_data_update.as_mut() {
+                                                        dup(DataUpdate::Banned(
+                                                            reason,
+                                                            DateTime::from_timestamp(unban_time, 0)
+                                                                .expect("unable to parse ban timestamp"),
+                                                        ));
+                                                    }
+                                                }
+                                                AdminAction::Kick(reason) => {
+                                                    if let Some(callback) = &mut dlock.func_disconnected {
+                                                        callback(DisconnectionType::Kicked(reason.clone()));
+                                                    }
+                                                    if let Some(dup) = dlock.func_data_update.as_mut() {
+                                                        dup(DataUpdate::Kicked(reason));
+                                                    }
+                                                }
+                                                AdminAction::Unban => {
+                                                    panic!("this should never happen");
+                                                }
+                                            }
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::AdminAction(aa));
+                                            }
+                                        }
+                                        ReadPacket::RequestSyncVariable(index, vari) => {
+                                            let mut dlock = data.write().await;
+                                            if let Some(Some(csu)) =
+                                                dlock.callback_server_update.remove(&index)
+                                            {
+                                                if let ServerUpdateCallback::SyncVariable(
+                                                    callback,
+                                                    pid,
+                                                    slot,
+                                                ) = csu.callback
+                                                {
+                                                    let obtained = if let Some(player) =
+                                                        dlock.players.get_mut(&pid)
+                                                    {
+                                                        if let Some(Some(sync)) = player.syncs.get_mut(slot)
+                                                        {
+                                                            if let OptionalValue::Some(value) = vari.clone()
+                                                            {
+                                                                sync.variables
+                                                                    .insert(csu.name.clone(), value);
+                                                            } else {
+                                                                sync.variables.remove(&*csu.name);
+                                                            }
+                                                        }
+                                                        true
+                                                    } else {
+                                                        false
+                                                    };
+                                                    if obtained {
+                                                        if let Some(dup) = &mut dlock.func_data_update {
+                                                            dup(DataUpdate::UpdateSyncVariable(
+                                                                pid,
+                                                                slot,
+                                                                csu.name.clone(),
+                                                                vari.clone(),
+                                                            ));
+                                                        }
+                                                    }
+                                                    if let Some(mut callback) = callback {
+                                                        callback(pid, csu.name, vari);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        ReadPacket::ChangeGameVersion(ver) => {
+                                            let mut dlock = data.write().await;
+                                            dlock.game_version = ver;
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::UpdateGameVersion(ver));
+                                            }
+                                        }
+                                        ReadPacket::ModifyAdministrator(pid, admin) => {
+                                            let mut dlock = data.write().await;
+                                            dlock.game_administrators.insert(Leb(pid), admin);
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::UpdateAdministrator(pid, Some(admin)));
+                                            }
+                                        }
+                                        ReadPacket::RemoveAdministrator(pid) => {
+                                            let mut dlock = data.write().await;
+                                            dlock.game_administrators.remove(&Leb(pid));
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::UpdateAdministrator(pid, None));
+                                            }
+                                        }
+                                        ReadPacket::PlayerIniWrite(upds) => {
+                                            let mut dlock = data.write().await;
+                                            for upd in upds {
+                                                if let OptionalValue::Some(value) = upd.value.clone() {
+                                                    dlock.game_save.insert(upd.name.clone(), value.clone());
+                                                } else {
+                                                    dlock.game_save.remove(&upd.name);
+                                                }
+                                                if let Some(dup) = &mut dlock.func_data_update {
+                                                    let keys = upd
+                                                        .name
+                                                        .split(">")
+                                                        .map(|entry| {
+                                                            urlencoding::decode(entry).expect(
+                                                                "unable to decode uri on playerini update",
+                                                            )
+                                                        })
+                                                        .collect::<Vec<_>>();
+                                                    if keys.len() == 3 {
+                                                        dup(DataUpdate::UpdatePlayerIni(
+                                                            Some(
+                                                                keys.first()
+                                                                    .expect("unable to fetch key 0")
+                                                                    .to_string(),
+                                                            ),
+                                                            keys.get(1)
+                                                                .expect("unable to fetch key 1")
+                                                                .to_string(),
+                                                            keys.first()
+                                                                .expect("unable to fetch key 2")
+                                                                .to_string(),
+                                                            upd.value,
+                                                        ));
+                                                    } else {
+                                                        dup(DataUpdate::UpdatePlayerIni(
+                                                            None,
+                                                            keys.first()
+                                                                .expect("unable to fetch key 0 on empty")
+                                                                .to_string(),
+                                                            keys.get(1)
+                                                                .expect("unable to fetch key 1 on empty")
+                                                                .to_string(),
+                                                            upd.value,
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        ReadPacket::RequestBdb(index, bdb) => {
+                                            let mut dlock = data.write().await;
+                                            if let Some(Some(mut csu)) = dlock
+                                                .callback_server_update
+                                                .get_mut(&index)
+                                                .map(|csu| csu.take())
+                                            {
+                                                if let ServerUpdateCallback::FetchBdb(Some(callback)) =
+                                                    &mut csu.callback
+                                                {
+                                                    callback(csu.name.clone(), bdb.clone());
+                                                }
+                                                if let Some(dup) = &mut dlock.func_data_update {
+                                                    dup(DataUpdate::FetchBdb(csu.name.clone(), bdb));
+                                                }
+                                            }
+                                        }
+                                        ReadPacket::ChangeFriendStatus(cfs, pid) => {
+                                            let mut dlock = data.write().await;
+                                            // Tl;dr: This is stupid
+                                            match cfs {
+                                                ChangeFriendStatus::Request => {
+                                                    dlock.player_incoming_friends.insert(pid);
+                                                    dlock.player_friends.remove(&pid);
+                                                    dlock.player_outgoing_friends.remove(&pid);
+                                                }
+                                                ChangeFriendStatus::Accept | ChangeFriendStatus::Friend => {
+                                                    dlock.player_friends.insert(pid);
+                                                    dlock.player_incoming_friends.remove(&pid);
+                                                    dlock.player_outgoing_friends.remove(&pid);
+                                                }
+                                                ChangeFriendStatus::Deny
+                                                | ChangeFriendStatus::Cancel
+                                                | ChangeFriendStatus::Remove
+                                                | ChangeFriendStatus::NotFriend => {
+                                                    dlock.player_friends.remove(&pid);
+                                                    dlock.player_incoming_friends.remove(&pid);
+                                                    dlock.player_outgoing_friends.remove(&pid);
+                                                }
+                                            }
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::ChangeFriendStatus(pid));
+                                            }
+                                        }
+                                        ReadPacket::ServerMessage(msg) => {
+                                            let mut dlock = data.write().await;
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::ServerMessage(msg.clone()));
+                                            }
+                                        }
+                                        ReadPacket::ChangeConnection(host) => {
+                                            let mut dlock = data.write().await;
+                                            dlock.is_connecting = true;
+                                            dlock.is_reconnecting = true;
+                                            if let Some(dup) = &mut dlock.func_data_update {
+                                                dup(DataUpdate::Reconnecting);
+                                            }
+                                            if let Ok((ws, _)) =
+                                                tokio_tungstenite::connect_async(&host).await
+                                            {
+                                                let (sread, swrite) = StreamHandler::split_stream(ws).await;
+                                                *writer.lock().await = swrite;
+                                                reader = sread;
+                                                dlock.last_host = Some(host);
+                                            } else {
+                                                return Err(Error::new(
+                                                    ErrorKind::ConnectionRefused,
+                                                    "unable to connect to new host",
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_e) => {
+                                return Err(Error::new(ErrorKind::BrokenPipe, "invalid read data"));
+                            }
+                        }
                     }
                 }
             }
@@ -1433,7 +1482,7 @@ impl CrystalServer {
                 version,
                 session,
             ) => {
-                b.write_leb_u64(0)?;
+                b.write_u8(0)?;
                 for hash in hash {
                     b.write_u64(*hash)?;
                 }
@@ -1444,7 +1493,7 @@ impl CrystalServer {
                 b.write_string(session)?;
             }
             WritePacket::Login(username, passw, game_token, variables, syncs, room) => {
-                b.write_leb_u64(1)?;
+                b.write_u8(1)?;
                 b.write_string(username)?;
                 match passw {
                     LoginPassw::Token(token) => {
@@ -1462,14 +1511,14 @@ impl CrystalServer {
                 b.write_string(room)?;
             }
             WritePacket::Register(username, email, passw, repeat_passw) => {
-                b.write_leb_u64(2)?;
+                b.write_u8(2)?;
                 b.write_string(username)?;
                 b.write_string(email)?;
                 b.write_string(passw)?;
                 b.write_string(repeat_passw)?;
             }
             WritePacket::RequestPlayerVariable(player_request, index, name) => {
-                b.write_leb_u64(3)?;
+                b.write_u8(3)?;
                 match player_request {
                     PlayerRequest::ID(pid) => {
                         b.write_bool(true)?;
@@ -1483,40 +1532,40 @@ impl CrystalServer {
                 b.write_leb_u64(*index)?;
             }
             WritePacket::P2P(player_request, mid, payload) => {
-                b.write_leb_u64(4)?;
+                b.write_u8(4)?;
                 b.write(player_request)?;
                 b.write_i16(*mid)?;
                 b.write(payload)?;
             }
             WritePacket::UpdateGameVersion(version) => {
-                b.write_leb_u64(5)?;
+                b.write_u8(5)?;
                 b.write_f64(*version)?;
             }
             WritePacket::UpdateGameSession(session) => {
-                b.write_leb_u64(6)?;
+                b.write_u8(6)?;
                 b.write_string(session)?;
             }
             WritePacket::UpdatePlayerVariable(updates) => {
-                b.write_leb_u64(7)?;
+                b.write_u8(7)?;
                 b.write(updates)?;
             }
             WritePacket::Ping() => {
-                b.write_leb_u64(8)?;
+                b.write_u8(8)?;
             }
             WritePacket::GameIniWrite(updates) => {
-                b.write_leb_u64(9)?;
+                b.write_u8(9)?;
                 b.write(updates)?;
             }
             WritePacket::PlayerIniWrite(updates) => {
-                b.write_leb_u64(10)?;
+                b.write_u8(10)?;
                 b.write(updates)?;
             }
             WritePacket::UpdateRoom(room) => {
-                b.write_leb_u64(11)?;
+                b.write_u8(11)?;
                 b.write_string(room)?;
             }
             WritePacket::NewSync(upds) => {
-                b.write_leb_u64(12)?;
+                b.write_u8(12)?;
                 b.write_leb_u64(upds.len() as u64)?;
                 for (slot, kind, sync_type, variables) in upds {
                     b.write_leb_u64(*slot)?;
@@ -1526,20 +1575,20 @@ impl CrystalServer {
                 }
             }
             WritePacket::UpdateSync(updates) => {
-                b.write_leb_u64(13)?;
+                b.write_u8(13)?;
                 b.write(updates)?;
             }
             WritePacket::UpdateAchievement(aid) => {
-                b.write_leb_u64(14)?;
+                b.write_u8(14)?;
                 b.write_leb_u64(*aid)?;
             }
             WritePacket::UpdateHighscore(hid, score) => {
-                b.write_leb_u64(15)?;
+                b.write_u8(15)?;
                 b.write_leb_u64(*hid)?;
                 b.write_f64(*score)?;
             }
             WritePacket::AdminAction(admin_action, pid) => {
-                b.write_leb_u64(16)?;
+                b.write_u8(16)?;
                 b.write_leb_u64(*pid)?;
                 match admin_action {
                     AdminAction::Ban(reason, time) => {
@@ -1557,41 +1606,48 @@ impl CrystalServer {
                 }
             }
             WritePacket::RequestSyncVariable(pid, index, slot, name) => {
-                b.write_leb_u64(17)?;
+                b.write_u8(17)?;
                 b.write_leb_u64(*pid)?;
                 b.write_string(name)?;
                 b.write_leb_u64(*index)?;
                 b.write_leb_u64(*slot)?;
             }
             WritePacket::Logout() => {
-                b.write_leb_u64(18)?;
+                b.write_u8(18)?;
             }
             WritePacket::RequestBdb(index, name) => {
-                b.write_leb_u64(19)?;
+                b.write_u8(19)?;
                 b.write_leb_u64(*index)?;
                 b.write_string(name)?;
             }
             WritePacket::SetBdb(name, payload) => {
-                b.write_leb_u64(20)?;
+                b.write_u8(20)?;
                 b.write_string(name)?;
                 b.write_bytes(payload)?;
             }
             WritePacket::RequestChangeFriendStatus(status, pid) => {
-                b.write_leb_u64(21)?;
+                b.write_u8(21)?;
                 b.write_u8(*status as u8)?;
                 b.write_leb_u64(*pid)?;
             }
             WritePacket::Handshake(key) => {
-                b.write_leb_u64(22)?;
+                b.write_u8(22)?;
                 b.write_string(key)?;
+            }
+            WritePacket::PacketCrunch(packets) => {
+                b.write_u8(23)?;
+                b.write_leb_u64(packets.len() as u64)?;
+                for packet in packets {
+                    b.write_all(Self::get_packet_write(packet)?.container.get_ref())?;
+                }
             }
         }
         Ok(b)
     }
 
     #[inline(always)]
-    fn get_packet_read(mut b: Buffer) -> IoResult<ReadPacket> {
-        let event = b.read_leb_u64()?;
+    fn get_packet_read(b: &mut Buffer) -> IoResult<ReadPacket> {
+        let event = b.read_u8()?;
         match event {
             0 => {
                 let code = RegistrationCode::try_from_primitive(b.read_u8()?).unwrap_or_default();
@@ -1768,6 +1824,13 @@ impl CrystalServer {
             24 => Ok(ReadPacket::Handshake(b.read()?)),
             25 => Ok(ReadPacket::ServerMessage(b.read_string()?)),
             26 => Ok(ReadPacket::ChangeConnection(b.read_string()?)),
+            27 => Ok({
+                let mut packets = Vec::new();
+                for _ in 0..b.read_leb_u64()? {
+                    packets.push(Self::get_packet_read(b)?);
+                }
+                ReadPacket::PacketCrunch(packets)
+            }),
             _ => Err(Error::new(
                 ErrorKind::InvalidData,
                 format!("unknown event {event}, erroring out"),
@@ -1849,10 +1912,8 @@ impl CrystalServer {
         if let Some(room_callback) = &mut dlock.func_room {
             let result = room_callback();
             if dlock.room != result && conn {
-                self.internal_iosend(Self::get_packet_write(&WritePacket::UpdateRoom(
-                    result.clone(),
-                ))?)
-                .await?;
+                self.internal_iosend(WritePacket::UpdateRoom(result.clone()))
+                    .await;
             }
             dlock.room = result;
         }
@@ -1930,8 +1991,7 @@ impl CrystalServer {
                     });
                 }
                 if !upds.is_empty() {
-                    self.internal_iosend(Self::get_packet_write(&WritePacket::UpdateSync(upds))?)
-                        .await?;
+                    self.internal_iosend(WritePacket::UpdateSync(upds)).await;
                 }
             }
             if !dlock.new_sync_queue.is_empty() {
@@ -1956,8 +2016,7 @@ impl CrystalServer {
                         ));
                     }
                 }
-                self.internal_iosend(Self::get_packet_write(&WritePacket::NewSync(data))?)
-                    .await?;
+                self.internal_iosend(WritePacket::NewSync(data)).await;
             }
             if !dlock.update_variable.is_empty() {
                 let mut data = Vec::new();
@@ -1966,10 +2025,8 @@ impl CrystalServer {
                     let value = dlock.variables.get(&name).cloned().into();
                     data.push(VariableUpdate { name, value });
                 }
-                self.internal_iosend(Self::get_packet_write(&WritePacket::UpdatePlayerVariable(
-                    data,
-                ))?)
-                .await?;
+                self.internal_iosend(WritePacket::UpdatePlayerVariable(data))
+                    .await;
             }
             if !dlock.update_playerini.is_empty() {
                 let mut data: Vec<VariableUpdate> = Vec::new();
@@ -1978,8 +2035,8 @@ impl CrystalServer {
                     let value = dlock.player_save.get(&name).cloned().into();
                     data.push(VariableUpdate { name, value });
                 }
-                self.internal_iosend(Self::get_packet_write(&WritePacket::PlayerIniWrite(data))?)
-                    .await?;
+                self.internal_iosend(WritePacket::PlayerIniWrite(data))
+                    .await;
             }
             if !dlock.update_gameini.is_empty() {
                 let mut data: Vec<VariableUpdate> = Vec::new();
@@ -1988,8 +2045,7 @@ impl CrystalServer {
                     let value = dlock.game_save.get(&name).cloned().into();
                     data.push(VariableUpdate { name, value });
                 }
-                self.internal_iosend(Self::get_packet_write(&WritePacket::GameIniWrite(data))?)
-                    .await?;
+                self.internal_iosend(WritePacket::GameIniWrite(data)).await;
             }
             if let Some(ping) = dlock.last_ping {
                 if ping.elapsed().as_secs_f64() >= 90.0 {
@@ -2112,45 +2168,42 @@ impl CrystalServer {
         lock.clear(true).await;
     }
 
-    async fn internal_iosend(&self, data: Buffer) -> IoResult<()> {
-        if let Some(writer) = &self.writer {
+    async fn internal_iosend(&self, data: WritePacket) {
+        let write_mpsc = self.data.read().await.write_mpsc.clone();
+        if let Some(writer) = write_mpsc {
             let writer = writer.clone();
-            let sdata = self.data.clone();
-            tokio::spawn(async move {
-                if let Err(_e) = writer.lock().await.write(data).await {
-                    #[cfg(feature = "__dev")]
-                    info!("unable to send data to server with error: {_e:?}");
-                    let mut dlock = sdata.write().await;
-                    dlock.clear(true).await;
-                    if dlock.call_disconnected {
-                        if let Some(func) = dlock.func_disconnected.as_mut() {
-                            func(DisconnectionType::Disconnected);
-                        }
-                        if let Some(dup) = dlock.func_data_update.as_mut() {
-                            dup(DataUpdate::Disconnected);
-                        }
-                        dlock.call_disconnected = false;
+            if let Err(_e) = writer.send(data) {
+                #[cfg(feature = "__dev")]
+                info!("unable to send data to server with error: {_e:?}");
+                let mut dlock = self.data.write().await;
+                dlock.clear(true).await;
+                if dlock.call_disconnected {
+                    if let Some(func) = dlock.func_disconnected.as_mut() {
+                        func(DisconnectionType::Disconnected);
                     }
+                    if let Some(dup) = dlock.func_data_update.as_mut() {
+                        dup(DataUpdate::Disconnected);
+                    }
+                    dlock.call_disconnected = false;
                 }
-            });
+            }
         } else {
             #[cfg(feature = "__dev")]
             info!("stream is not open for writing");
         }
-        Ok(())
     }
 
-    async fn internal_login(&self, username: &str, loginpassw: LoginPassw) -> IoResult<()> {
+    async fn internal_login(&self, username: &str, loginpassw: LoginPassw) {
         self.internal_iosend({
             let dlock = self.data.read().await;
-            Self::get_packet_write(&WritePacket::Login(
+            WritePacket::Login(
                 username.to_owned(),
                 loginpassw,
                 dlock.game_token.clone(),
                 dlock.variables.clone(),
                 dlock.syncs.clone(),
                 dlock.room.clone(),
-            ))?
+            )
         })
         .await
     }
@@ -2160,12 +2213,7 @@ impl CrystalServer {
     /// The login result will be sent as a callback event.
     /// Use [CrystalServer::callback_set_login] and [CrystalServer::callback_set_login_token]
     /// respectively to obtain data from the login attempt.
-    pub async fn login(
-        &self,
-        username: &str,
-        passw: &str,
-        callback: Option<CallbackLogin>,
-    ) -> IoResult<()> {
+    pub async fn login(&self, username: &str, passw: &str, callback: Option<CallbackLogin>) {
         self.data.write().await.func_login = callback;
         self.internal_login(username, LoginPassw::Passw(passw.to_owned()))
             .await
@@ -2181,7 +2229,7 @@ impl CrystalServer {
         username: &str,
         token: &str,
         callback: Option<CallbackLogin>,
-    ) -> IoResult<()> {
+    ) {
         self.data.write().await.func_login = callback;
         self.internal_login(username, LoginPassw::Token(token.to_owned()))
             .await
@@ -2198,14 +2246,14 @@ impl CrystalServer {
         passw: &str,
         repeat_passw: &str,
         callback: Option<CallbackRegister>,
-    ) -> IoResult<()> {
+    ) {
         self.data.write().await.func_register = callback;
-        self.internal_iosend(Self::get_packet_write(&WritePacket::Register(
+        self.internal_iosend(WritePacket::Register(
             username.to_owned(),
             email.to_owned(),
             passw.to_owned(),
             repeat_passw.to_owned(),
-        ))?)
+        ))
         .await
     }
 
@@ -2312,14 +2360,12 @@ impl CrystalServer {
                 dlock.callback_server_index += 1;
                 index
             };
-            self.internal_iosend(Self::get_packet_write(
-                &WritePacket::RequestPlayerVariable(
-                    PlayerRequest::ID(pid),
-                    index as u64,
-                    name.to_owned(),
-                ),
-            )?)
-            .await?;
+            self.internal_iosend(WritePacket::RequestPlayerVariable(
+                PlayerRequest::ID(pid),
+                index as u64,
+                name.to_owned(),
+            ))
+            .await;
             Ok(())
         } else {
             Err(Error::new(ErrorKind::NotFound, "unable to find player id"))
@@ -2329,25 +2375,16 @@ impl CrystalServer {
     /// Sends a message "peer-to-peer" to the requested target.
     /// The Message ID will allow you to quickly differentiate what message it's
     /// supposed to be.
-    pub async fn p2p(
-        &self,
-        target: PlayerRequest,
-        message_id: i16,
-        payload: Vec<Value>,
-    ) -> IoResult<()> {
-        self.internal_iosend(Self::get_packet_write(&WritePacket::P2P(
-            target, message_id, payload,
-        ))?)
-        .await
+    pub async fn p2p(&self, target: PlayerRequest, message_id: i16, payload: Vec<Value>) {
+        self.internal_iosend(WritePacket::P2P(target, message_id, payload))
+            .await
     }
 
     /// Sets the current game version.
-    pub async fn set_version(&self, version: f64) -> IoResult<()> {
+    pub async fn set_version(&self, version: f64) {
         self.data.write().await.version = version;
-        self.internal_iosend(Self::get_packet_write(&WritePacket::UpdateGameVersion(
-            version,
-        ))?)
-        .await
+        self.internal_iosend(WritePacket::UpdateGameVersion(version))
+            .await
     }
 
     /// Gets the current set version.
@@ -2361,12 +2398,10 @@ impl CrystalServer {
     }
 
     /// Sets the current game session.
-    pub async fn set_session(&self, session: &str) -> IoResult<()> {
+    pub async fn set_session(&self, session: &str) {
         self.data.write().await.session = session.to_owned();
-        self.internal_iosend(Self::get_packet_write(&WritePacket::UpdateGameSession(
-            session.to_owned(),
-        ))?)
-        .await
+        self.internal_iosend(WritePacket::UpdateGameSession(session.to_owned()))
+            .await
     }
 
     /// Gets the current set session.
@@ -2553,20 +2588,17 @@ impl CrystalServer {
     }
 
     /// Make the current player reach an achievement.
-    pub async fn reach_achievement(&self, aid: u64) -> IoResult<()> {
+    pub async fn reach_achievement(&self, aid: u64) {
         if !self.has_reached_achievement(aid).await {
             let mut dlock = self.data.write().await;
             if dlock.player_id.is_some() {
                 if let Some(achievement) = dlock.game_achievements.get_mut(&Leb(aid)) {
                     achievement.unlocked = Some(Utc::now().timestamp());
-                    self.internal_iosend(Self::get_packet_write(&WritePacket::UpdateAchievement(
-                        aid,
-                    ))?)
-                    .await?;
+                    self.internal_iosend(WritePacket::UpdateAchievement(aid))
+                        .await;
                 }
             }
         }
-        Ok(())
     }
 
     /// Checks if a highscore exists.
@@ -2626,17 +2658,13 @@ impl CrystalServer {
                 if let Some(hscore) = highscore.scores.get_mut(&Leb(player_id)) {
                     if *hscore != score {
                         *hscore = score;
-                        self.internal_iosend(Self::get_packet_write(
-                            &WritePacket::UpdateHighscore(hid, score),
-                        )?)
-                        .await?;
+                        self.internal_iosend(WritePacket::UpdateHighscore(hid, score))
+                            .await;
                     }
                 } else {
                     highscore.scores.insert(Leb(player_id), score);
-                    self.internal_iosend(Self::get_packet_write(&WritePacket::UpdateHighscore(
-                        hid, score,
-                    ))?)
-                    .await?;
+                    self.internal_iosend(WritePacket::UpdateHighscore(hid, score))
+                        .await;
                 }
             }
         }
@@ -2808,7 +2836,7 @@ impl CrystalServer {
     /// If the player doesn't have permission to kick the player,
     /// the function will return [false] and nothing will happen.
     /// You can kick yourself with this function without any checks.
-    pub async fn player_kick(&self, pid: u64, reason: &str) -> IoResult<bool> {
+    pub async fn player_kick(&self, pid: u64, reason: &str) -> bool {
         if self.get_player_id().await == Some(pid)
             || self
                 .get_player_admin(self.get_player_id().await.unwrap_or(u64::MAX))
@@ -2816,14 +2844,14 @@ impl CrystalServer {
                 .unwrap_or_default()
                 .can_kick
         {
-            self.internal_iosend(Self::get_packet_write(&WritePacket::AdminAction(
+            self.internal_iosend(WritePacket::AdminAction(
                 AdminAction::Kick(reason.to_owned()),
                 pid,
-            ))?)
-            .await?;
-            Ok(true)
+            ))
+            .await;
+            true
         } else {
-            Ok(false)
+            false
         }
     }
 
@@ -2831,12 +2859,7 @@ impl CrystalServer {
     /// If the player doesn't have permission to ban the player,
     /// the function will return [false] and nothing will happen.
     /// You can ban yourself with this function without any checks.
-    pub async fn player_ban(
-        &self,
-        pid: u64,
-        reason: &str,
-        unban_time: DateTime<Utc>,
-    ) -> IoResult<bool> {
+    pub async fn player_ban(&self, pid: u64, reason: &str, unban_time: DateTime<Utc>) -> bool {
         if self.get_player_id().await == Some(pid)
             || self
                 .get_player_admin(self.get_player_id().await.unwrap_or(u64::MAX))
@@ -2844,46 +2867,42 @@ impl CrystalServer {
                 .unwrap_or_default()
                 .can_ban
         {
-            self.internal_iosend(Self::get_packet_write(&WritePacket::AdminAction(
+            self.internal_iosend(WritePacket::AdminAction(
                 AdminAction::Ban(reason.to_string(), unban_time.timestamp()),
                 pid,
-            ))?)
-            .await?;
-            Ok(true)
+            ))
+            .await;
+            true
         } else {
-            Ok(false)
+            false
         }
     }
 
     /// Unbans the specified player from the game.
     /// If the player doesn't have permission to unban the player,
     /// the function will return [false] and nothing will happen.
-    pub async fn player_unban(&self, pid: u64) -> IoResult<bool> {
+    pub async fn player_unban(&self, pid: u64) -> bool {
         if self
             .get_player_admin(self.get_player_id().await.unwrap_or(u64::MAX))
             .await
             .unwrap_or_default()
             .can_unban
         {
-            self.internal_iosend(Self::get_packet_write(&WritePacket::AdminAction(
-                AdminAction::Unban,
-                pid,
-            ))?)
-            .await?;
-            Ok(true)
+            self.internal_iosend(WritePacket::AdminAction(AdminAction::Unban, pid))
+                .await;
+            true
         } else {
-            Ok(false)
+            false
         }
     }
 
     /// Logs out from the account currently playing in.
-    pub async fn logout(&self) -> IoResult<bool> {
+    pub async fn logout(&self) -> bool {
         if self.is_loggedin().await {
-            self.internal_iosend(Self::get_packet_write(&WritePacket::Logout())?)
-                .await?;
-            Ok(true)
+            self.internal_iosend(WritePacket::Logout()).await;
+            true
         } else {
-            Ok(false)
+            false
         }
     }
 
@@ -2924,13 +2943,13 @@ impl CrystalServer {
                     dlock.callback_server_index += 1;
                     index
                 };
-                self.internal_iosend(Self::get_packet_write(&WritePacket::RequestSyncVariable(
+                self.internal_iosend(WritePacket::RequestSyncVariable(
                     pid,
                     index as u64,
                     slot as u64,
                     name.to_owned(),
-                ))?)
-                .await?;
+                ))
+                .await;
                 Ok(())
             } else {
                 Err(Error::new(ErrorKind::NotFound, "unable to find sync"))
@@ -2944,11 +2963,7 @@ impl CrystalServer {
     ///
     /// The result will be saved as normal and will be sent as a callback event.
     /// Use [CrystalServer::callback_set_data_update] or the `callback` variable to fetch it.
-    pub async fn fetch_bdb(
-        &self,
-        name: &str,
-        callback: Option<FetchBdbServerUpdate>,
-    ) -> IoResult<()> {
+    pub async fn fetch_bdb(&self, name: &str, callback: Option<FetchBdbServerUpdate>) {
         let mut dlock = self.data.write().await;
         let index = if let Some((index, csu)) = dlock
             .callback_server_update
@@ -2972,21 +2987,14 @@ impl CrystalServer {
             dlock.callback_server_index += 1;
             index
         };
-        self.internal_iosend(Self::get_packet_write(&WritePacket::RequestBdb(
-            index as u64,
-            name.to_owned(),
-        ))?)
-        .await?;
-        Ok(())
+        self.internal_iosend(WritePacket::RequestBdb(index as u64, name.to_owned()))
+            .await;
     }
 
     /// Update the data of a Binary Data Block.
-    pub async fn set_bdb(&self, name: &str, data: Vec<u8>) -> IoResult<()> {
-        self.internal_iosend(Self::get_packet_write(&WritePacket::SetBdb(
-            name.to_owned(),
-            data,
-        ))?)
-        .await
+    pub async fn set_bdb(&self, name: &str, data: Vec<u8>) {
+        self.internal_iosend(WritePacket::SetBdb(name.to_owned(), data))
+            .await
     }
 
     /// Obtain the player's incoming friend requests.
@@ -3020,7 +3028,7 @@ impl CrystalServer {
     }
 
     /// Send a friend request to a player.
-    pub async fn send_outgoing_friend(&self, pid: u64) -> IoResult<()> {
+    pub async fn send_outgoing_friend(&self, pid: u64) {
         if self.is_loggedin().await {
             {
                 let mut dlock = self.data.write().await;
@@ -3028,90 +3036,90 @@ impl CrystalServer {
                     || dlock.player_outgoing_friends.contains(&pid)
                     || dlock.player_incoming_friends.contains(&pid)
                 {
-                    return Ok(());
+                    return;
                 }
                 dlock.player_outgoing_friends.insert(pid);
             }
-            self.internal_iosend(Self::get_packet_write(
-                &WritePacket::RequestChangeFriendStatus(ChangeFriendStatus::Request, pid),
-            )?)
-            .await?;
+            self.internal_iosend(WritePacket::RequestChangeFriendStatus(
+                ChangeFriendStatus::Request,
+                pid,
+            ))
+            .await;
         }
-        Ok(())
     }
 
     /// Cancel the sent friend request of a player.
-    pub async fn remove_outgoing_friend(&self, pid: u64) -> IoResult<()> {
+    pub async fn remove_outgoing_friend(&self, pid: u64) {
         if self.is_loggedin().await {
             {
                 let mut dlock = self.data.write().await;
                 if !dlock.player_outgoing_friends.contains(&pid) {
-                    return Ok(());
+                    return;
                 }
                 dlock.player_outgoing_friends.remove(&pid);
             }
-            self.internal_iosend(Self::get_packet_write(
-                &WritePacket::RequestChangeFriendStatus(ChangeFriendStatus::Cancel, pid),
-            )?)
-            .await?;
+            self.internal_iosend(WritePacket::RequestChangeFriendStatus(
+                ChangeFriendStatus::Cancel,
+                pid,
+            ))
+            .await;
         }
-        Ok(())
     }
 
     /// Deny the received friend request of a player.
-    pub async fn deny_incoming_friend(&self, pid: u64) -> IoResult<()> {
+    pub async fn deny_incoming_friend(&self, pid: u64) {
         if self.is_loggedin().await {
             {
                 let mut dlock = self.data.write().await;
                 if !dlock.player_incoming_friends.contains(&pid) {
-                    return Ok(());
+                    return;
                 }
                 dlock.player_incoming_friends.remove(&pid);
             }
-            self.internal_iosend(Self::get_packet_write(
-                &WritePacket::RequestChangeFriendStatus(ChangeFriendStatus::Deny, pid),
-            )?)
-            .await?;
+            self.internal_iosend(WritePacket::RequestChangeFriendStatus(
+                ChangeFriendStatus::Deny,
+                pid,
+            ))
+            .await;
         }
-        Ok(())
     }
 
     /// Accept the received the friend request of a player.
-    pub async fn accept_incoming_friend(&self, pid: u64) -> IoResult<()> {
+    pub async fn accept_incoming_friend(&self, pid: u64) {
         if self.is_loggedin().await {
             {
                 let mut dlock = self.data.write().await;
                 if !dlock.player_incoming_friends.contains(&pid)
                     || dlock.player_friends.contains(&pid)
                 {
-                    return Ok(());
+                    return;
                 }
                 dlock.player_incoming_friends.remove(&pid);
                 dlock.player_friends.insert(pid);
             }
-            self.internal_iosend(Self::get_packet_write(
-                &WritePacket::RequestChangeFriendStatus(ChangeFriendStatus::Accept, pid),
-            )?)
-            .await?;
+            self.internal_iosend(WritePacket::RequestChangeFriendStatus(
+                ChangeFriendStatus::Accept,
+                pid,
+            ))
+            .await;
         }
-        Ok(())
     }
 
     /// Remove a friend from the player's friend list.
-    pub async fn remove_friend(&self, pid: u64) -> IoResult<()> {
+    pub async fn remove_friend(&self, pid: u64) {
         if self.is_loggedin().await {
             {
                 let mut dlock = self.data.write().await;
                 if !dlock.player_friends.contains(&pid) {
-                    return Ok(());
+                    return;
                 }
                 dlock.player_friends.remove(&pid);
             }
-            self.internal_iosend(Self::get_packet_write(
-                &WritePacket::RequestChangeFriendStatus(ChangeFriendStatus::Remove, pid),
-            )?)
-            .await?;
+            self.internal_iosend(WritePacket::RequestChangeFriendStatus(
+                ChangeFriendStatus::Remove,
+                pid,
+            ))
+            .await;
         }
-        Ok(())
     }
 }
