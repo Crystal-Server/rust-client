@@ -270,9 +270,7 @@ impl StreamReader {
     #[inline(always)]
     pub async fn read(&mut self) -> Result<Buffer, ReaderError> {
         if let Some(stream) = self.stream.as_mut() {
-            let r = stream.next().await;
-            println!("{:?}", r);
-            if let Some(Ok(frame)) = r {
+            if let Some(Ok(frame)) = stream.next().await {
                 if frame.is_binary() {
                     let data = frame.into_data();
                     if !data.is_empty() {
