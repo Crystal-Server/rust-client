@@ -84,7 +84,6 @@ pub(crate) struct NewSyncQueue {
     pub sync_type: SyncType,
 }
 
-#[derive(Debug)]
 pub(crate) struct CallbackServerUpdate {
     pub name: String,
     pub callback: ServerUpdateCallback,
@@ -92,19 +91,23 @@ pub(crate) struct CallbackServerUpdate {
 
 pub type PlayerVariableServerUpdate =
     Box<dyn FnMut(u64, String, OptionalValue) + core::marker::Sync + Send>;
-
 pub type SyncVariableServerUpdate =
     Box<dyn FnMut(u64, String, OptionalValue) + core::marker::Sync + Send>;
-
 pub type FetchBdbServerUpdate = Box<dyn FnMut(String, Option<Vec<u8>>) + core::marker::Sync + Send>;
+pub type ExistsBdbServerUpdate = Box<dyn FnMut(String, bool) + core::marker::Sync + Send>;
+pub type WriteBdbServerUpdate = Box<dyn FnMut(String, SetBdbFile) + core::marker::Sync + Send>;
 
 pub(crate) enum ServerUpdateCallback {
     /// Callback, Player ID
     PlayerVariable(Option<PlayerVariableServerUpdate>, u64),
     /// Callback, Player ID, Sync Slot
     SyncVariable(Option<SyncVariableServerUpdate>, u64, usize),
-    /// Callback, BDB Name
+    /// Callback
     FetchBdb(Option<FetchBdbServerUpdate>),
+    /// Callback
+    ExistsBdb(Option<ExistsBdbServerUpdate>),
+    /// Callback
+    WriteBdb(Option<WriteBdbServerUpdate>),
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, TryFromPrimitive)]
@@ -159,8 +162,8 @@ pub enum DataUpdate {
     AdminAction(AdminAction),
     /// Player ID, Administrator Permissions
     UpdateAdministrator(u64, Option<Administrator>),
-    /// Name, Value
-    FetchBdb(String, Option<Vec<u8>>),
+    /// Name, Value, Permissions
+    FetchBdb(String, Option<Vec<u8>>, Option<BdbPermission>),
     /// Player ID
     ChangeFriendStatus(u64),
     /// Message
@@ -228,6 +231,7 @@ pub(crate) enum LoginPassw {
 /// The target it should request something from/to
 #[derive(Debug, Clone, Copy)]
 pub enum PlayerRequest {
+    /// Player ID
     ID(u64),
     AllGame,
     CurrentSession,
@@ -242,6 +246,21 @@ pub enum AdminAction {
     Ban(String, i64),
     /// Reason
     Kick(String),
+}
+
+#[derive(Debug, Copy, Clone, TryFromPrimitive)]
+#[repr(u8)]
+pub enum SetBdbFile {
+    /// The file (and permissions) were set correctly.
+    Ok = 0,
+    /// The BDB file is too big.
+    TooBig = 1,
+    /// There are too many BDB files registered.
+    TooManyFiles = 2,
+    /// The player doesn't have sufficient permissions to perform this action.
+    InsufficientPermissions = 3,
+    /// An internal error happened.
+    Error = 4,
 }
 
 #[derive(Debug, Clone)]
@@ -323,17 +342,91 @@ pub(crate) enum ChangeFriendStatus {
     NotFriend = 6,
 }
 
-impl std::fmt::Debug for ServerUpdateCallback {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::FetchBdb(_) => "FetchBdb(...)",
-                Self::PlayerVariable(_, _) => "PlayerVariable(...)",
-                Self::SyncVariable(_, _, _) => "SyncVariable(...)",
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct BdbPermission: u8 {
+        const Read = 1 << 0;
+        const Write = 1 << 1;
+        const Create = 1 << 2;
+        const Delete = 1 << 3;
+        const ManagePermissions = 1 << 4;
+        const CreateAndManagePermissions = 1 << 5;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, std::hash::Hash)]
+pub enum BdbPermissionTarget {
+    Default,
+    AllAdministrators,
+    GameOwner,
+    PlayerId(u64),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BdbFilePermissions {
+    pub default: HashMap<BdbPermissionTarget, BdbPermission>,
+    pub current: HashMap<BdbPermissionTarget, BdbPermission>,
+}
+
+impl Serialize for BdbPermissionTarget {
+    fn write(&self, buffer: &mut Buffer) -> Result<()> {
+        match self {
+            Self::Default => buffer.write_u8(0)?,
+            Self::AllAdministrators => buffer.write_u8(1)?,
+            Self::GameOwner => buffer.write_u8(2)?,
+            Self::PlayerId(pid) => {
+                buffer.write_u8(3)?;
+                buffer.write_leb_u64(*pid)?;
             }
-        )
+        }
+
+        Ok(())
+    }
+
+    fn read(buffer: &mut Buffer) -> Result<Self> {
+        match buffer.read_u8()? {
+            0 => Ok(Self::Default),
+            1 => Ok(Self::AllAdministrators),
+            2 => Ok(Self::GameOwner),
+            3 => Ok(Self::PlayerId(buffer.read_leb_u64()?)),
+            _ => Err(Error::from(ErrorKind::InvalidData)),
+        }
+    }
+}
+
+impl Serialize for BdbFilePermissions {
+    fn write(&self, buffer: &mut Buffer) -> Result<()> {
+        buffer.write(
+            &self
+                .default
+                .iter()
+                .map(|(target, perms)| (*target, perms.bits()))
+                .collect::<HashMap<_, _>>(),
+        )?;
+        buffer.write(
+            &self
+                .current
+                .iter()
+                .map(|(target, perms)| (*target, perms.bits()))
+                .collect::<HashMap<_, _>>(),
+        )?;
+
+        Ok(())
+    }
+
+    fn read(buffer: &mut Buffer) -> Result<Self> {
+        Ok(Self {
+            default: buffer
+                .read::<HashMap<_, u8>>()?
+                .into_iter()
+                .map(|(target, perms)| (target, BdbPermission::from_bits_retain(perms)))
+                .collect::<HashMap<_, _>>(),
+            current: buffer
+                .read::<HashMap<_, u8>>()?
+                .into_iter()
+                .map(|(target, perms)| (target, BdbPermission::from_bits_retain(perms)))
+                .collect::<HashMap<_, _>>(),
+        })
     }
 }
 

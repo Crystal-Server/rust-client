@@ -1,4 +1,7 @@
-use crate::types::{DisconnectionType, NewSync};
+use crate::types::{
+    BdbFilePermissions, BdbPermission, DisconnectionType, ExistsBdbServerUpdate, NewSync,
+    SetBdbFile, WriteBdbServerUpdate,
+};
 
 use super::{
     buffer::Buffer,
@@ -267,7 +270,9 @@ impl StreamReader {
     #[inline(always)]
     pub async fn read(&mut self) -> Result<Buffer, ReaderError> {
         if let Some(stream) = self.stream.as_mut() {
-            if let Some(Ok(frame)) = stream.next().await {
+            let r = stream.next().await;
+            println!("{:?}", r);
+            if let Some(Ok(frame)) = r {
                 if frame.is_binary() {
                     let data = frame.into_data();
                     if !data.is_empty() {
@@ -467,7 +472,7 @@ enum ReadPacket {
     ClearPlayers(),
     /// Variables
     GameIniWrite(Vec<VariableUpdate>),
-    /// Player ID, Vec<Slot, Kind, Type, Variables>
+    /// Player ID, Vec<(Slot, Kind, Type, Variables)>
     NewSync(u64, Vec<(u64, i16, SyncType, HashMap<String, Value>)>),
     /// Player ID, Room
     PlayerChangedRooms(u64, String),
@@ -492,11 +497,10 @@ enum ReadPacket {
     ForceDisconnection(),
     /// Variables
     PlayerIniWrite(Vec<VariableUpdate>),
-    /// Callback Index, BDB
-    RequestBdb(u64, Option<Vec<u8>>),
+    /// Callback Index, BDB Data, File Permissions
+    RequestBdb(u64, Option<Vec<u8>>, Option<BdbPermission>),
     /// Change Friend Status, Player ID
     ChangeFriendStatus(ChangeFriendStatus, u64),
-    /// Key
     Handshake(Option<String>),
     /// Message
     ServerMessage(String),
@@ -504,6 +508,10 @@ enum ReadPacket {
     ChangeConnection(String),
     /// Packets
     PacketCrunch(Vec<ReadPacket>),
+    /// Callback Index, Exists
+    ExistsBdb(u64, bool),
+    /// Callback Index, Status
+    SetBdb(u64, SetBdbFile),
 }
 
 #[derive(Debug, Clone)]
@@ -539,7 +547,7 @@ enum WritePacket {
     PlayerIniWrite(Vec<VariableUpdate>),
     /// Room
     UpdateRoom(String),
-    /// Vec<Slot, Kind, Sync Type, Variables>
+    /// Vec<(Slot, Kind, Sync Type, Value)>
     NewSync(Vec<(u64, i16, SyncType, HashMap<String, Value>)>),
     /// Sync Update
     UpdateSync(Vec<SyncUpdate>),
@@ -552,16 +560,18 @@ enum WritePacket {
     /// Player ID, Callback Index, Sync Slot, Variable Name
     RequestSyncVariable(u64, u64, u64, String),
     Logout(),
-    /// Callback Index, BDB Name
+    /// BDB Name
     RequestBdb(u64, String),
-    /// BDB Name, Data
-    SetBdb(String, Vec<u8>),
+    /// Callback Index, BDB Name, Data, File Permissions
+    SetBdb(u64, String, Vec<u8>, Option<BdbFilePermissions>),
     /// Change Friend Status, Player ID
     RequestChangeFriendStatus(ChangeFriendStatus, u64),
     /// Key
     Handshake(String),
     /// Packets
     PacketCrunch(Vec<WritePacket>),
+    /// Callback Index, BDB Name
+    ExistsBdb(u64, String),
 }
 
 impl CrystalServer {
@@ -1355,7 +1365,7 @@ impl CrystalServer {
                                                 }
                                             }
                                         }
-                                        ReadPacket::RequestBdb(index, bdb) => {
+                                        ReadPacket::RequestBdb(index, bdb, perms) => {
                                             let mut dlock = data.write().await;
                                             if let Some(Some(mut csu)) = dlock
                                                 .callback_server_update
@@ -1368,7 +1378,7 @@ impl CrystalServer {
                                                     callback(csu.name.clone(), bdb.clone());
                                                 }
                                                 if let Some(dup) = &mut dlock.func_data_update {
-                                                    dup(DataUpdate::FetchBdb(csu.name.clone(), bdb));
+                                                    dup(DataUpdate::FetchBdb(csu.name.clone(), bdb, perms));
                                                 }
                                             }
                                         }
@@ -1424,6 +1434,22 @@ impl CrystalServer {
                                                     ErrorKind::ConnectionRefused,
                                                     "unable to connect to new host",
                                                 ));
+                                            }
+                                        }
+                                        ReadPacket::ExistsBdb(index, exists) => {
+                                            let mut dlock = data.write().await;
+                                            if let Some(Some(csu)) = dlock.callback_server_update.remove(&index) {
+                                                if let ServerUpdateCallback::ExistsBdb(Some(mut callback)) = csu.callback {
+                                                    callback(csu.name, exists);
+                                                }
+                                            }
+                                        }
+                                        ReadPacket::SetBdb(index, status) => {
+                                            let mut dlock = data.write().await;
+                                            if let Some(Some(csu)) = dlock.callback_server_update.remove(&index) {
+                                                if let ServerUpdateCallback::WriteBdb(Some(mut callback)) = csu.callback {
+                                                    callback(csu.name, status);
+                                                }
                                             }
                                         }
                                     }
@@ -1620,10 +1646,12 @@ impl CrystalServer {
                 b.write_leb_u64(*index)?;
                 b.write_string(name)?;
             }
-            WritePacket::SetBdb(name, payload) => {
+            WritePacket::SetBdb(index, name, payload, perms) => {
                 b.write_u8(20)?;
+                b.write_leb_u64(*index)?;
                 b.write_string(name)?;
                 b.write_bytes(payload)?;
+                b.write(perms)?;
             }
             WritePacket::RequestChangeFriendStatus(status, pid) => {
                 b.write_u8(21)?;
@@ -1640,6 +1668,11 @@ impl CrystalServer {
                 for packet in packets {
                     b.write_all(Self::get_packet_write(packet)?.container.get_ref())?;
                 }
+            }
+            WritePacket::ExistsBdb(index, name) => {
+                b.write_u8(24)?;
+                b.write_leb_u64(*index)?;
+                b.write_string(name)?;
             }
         }
         Ok(b)
@@ -1813,7 +1846,8 @@ impl CrystalServer {
             22 => {
                 let index = b.read_leb_u64()?;
                 let data = b.read()?;
-                Ok(ReadPacket::RequestBdb(index, data))
+                let perms = b.read::<Option<u8>>()?.map(BdbPermission::from_bits_retain);
+                Ok(ReadPacket::RequestBdb(index, data, perms))
             }
             23 => {
                 let status =
@@ -1830,6 +1864,17 @@ impl CrystalServer {
                     packets.push(Self::get_packet_read(b)?);
                 }
                 ReadPacket::PacketCrunch(packets)
+            }),
+            28 => Ok({
+                let index = b.read_leb_u64()?;
+                let exists = b.read_bool()?;
+                ReadPacket::ExistsBdb(index, exists)
+            }),
+            29 => Ok({
+                let index = b.read_leb_u64()?;
+                let status =
+                    SetBdbFile::try_from_primitive(b.read_u8()?).unwrap_or(SetBdbFile::Error);
+                ReadPacket::SetBdb(index, status)
             }),
             _ => Err(Error::new(
                 ErrorKind::InvalidData,
@@ -2992,8 +3037,74 @@ impl CrystalServer {
     }
 
     /// Update the data of a Binary Data Block.
-    pub async fn set_bdb(&self, name: &str, data: Vec<u8>) {
-        self.internal_iosend(WritePacket::SetBdb(name.to_owned(), data))
+    /// If [permissions] is [None] it will leave the default BDB permissions.
+    /// If it's not then it'll append the new set permissions if the player
+    /// has permission to do so and save the permissions.
+    pub async fn set_bdb(
+        &self,
+        name: &str,
+        data: Vec<u8>,
+        permissions: Option<BdbFilePermissions>,
+        callback: Option<WriteBdbServerUpdate>,
+    ) {
+        let mut dlock = self.data.write().await;
+        let index = if let Some((index, csu)) = dlock
+            .callback_server_update
+            .iter_mut()
+            .find(|(_, csu)| csu.is_none())
+        {
+            *csu = Some(CallbackServerUpdate {
+                name: name.to_owned(),
+                callback: ServerUpdateCallback::WriteBdb(callback),
+            });
+            *index
+        } else {
+            let index = dlock.callback_server_index;
+            dlock.callback_server_update.insert(
+                index,
+                Some(CallbackServerUpdate {
+                    name: name.to_owned(),
+                    callback: ServerUpdateCallback::WriteBdb(callback),
+                }),
+            );
+            dlock.callback_server_index += 1;
+            index
+        };
+        self.internal_iosend(WritePacket::SetBdb(
+            index,
+            name.to_owned(),
+            data,
+            permissions,
+        ))
+        .await
+    }
+
+    /// Check if a Binary Data Block exists.
+    pub async fn has_bdb(&self, name: &str, callback: Option<ExistsBdbServerUpdate>) {
+        let mut dlock = self.data.write().await;
+        let index = if let Some((index, csu)) = dlock
+            .callback_server_update
+            .iter_mut()
+            .find(|(_, csu)| csu.is_none())
+        {
+            *csu = Some(CallbackServerUpdate {
+                name: name.to_owned(),
+                callback: ServerUpdateCallback::ExistsBdb(callback),
+            });
+            *index
+        } else {
+            let index = dlock.callback_server_index;
+            dlock.callback_server_update.insert(
+                index,
+                Some(CallbackServerUpdate {
+                    name: name.to_owned(),
+                    callback: ServerUpdateCallback::ExistsBdb(callback),
+                }),
+            );
+            dlock.callback_server_index += 1;
+            index
+        };
+        self.internal_iosend(WritePacket::ExistsBdb(index as u64, name.to_owned()))
             .await
     }
 
