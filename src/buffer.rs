@@ -66,11 +66,13 @@ impl Buffer {
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
         self.container.read_to_end(buf)
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn read_all(&mut self, buf: &mut Vec<u8>) -> Result<()> {
         let pos = self.position()?;
         self.seek(SeekFrom::Start(0))?;

@@ -112,7 +112,7 @@ type CallbackDataUpdate = Box<dyn FnMut(DataUpdate) + Sync + Send>;
 #[derive(Default)]
 struct StreamData {
     thread: Option<JoinHandle<()>>,
-    write_mpsc: Option<UnboundedSender<WritePacket>>, // todo: finish this shit i'm lazy rn lol
+    write_mpsc: Option<UnboundedSender<WritePacket>>,
     last_host: Option<String>,
 
     is_connected: bool,
@@ -369,16 +369,7 @@ impl StreamWriter {
     pub async fn write_raw(&mut self, data: &mut Buffer) -> Result<(), WriterError> {
         /*#[cfg(feature = "__dev")]
         info!("wrote data: {:?}", data.container.get_ref().to_str_lossy());*/
-        let data = {
-            let mut d = Vec::new();
-            unwrap_return!(
-                data.read_all(&mut d),
-                Err(WriterError::Unknown(String::from(
-                    "unable to convert buffer into bytes"
-                )))
-            );
-            d
-        };
+        let data = data.container.get_ref().clone();
         if let Some(stream) = self.stream.as_mut() {
             unwrap_return!(
                 stream
@@ -678,9 +669,9 @@ impl CrystalServer {
 
             let (write_mpsc, mut read_mpsc) = mpsc::unbounded_channel();
             data.write().await.write_mpsc = Some(write_mpsc);
+            let mut send_packets = Vec::new();
             let send_timeout = time::sleep(Duration::from_nanos(1));
             tokio::pin!(send_timeout);
-            let mut send_packets = Vec::new();
 
             #[cfg(feature = "__dev")]
             info!("Initialized stream handle task");
@@ -698,6 +689,7 @@ impl CrystalServer {
                         }
                     }
                     _ = &mut send_timeout => {
+                        send_timeout.set(time::sleep(Duration::MAX));
                         if send_packets.len() >= 5 {
                             write_packet!(WritePacket::PacketCrunch(std::mem::take(&mut send_packets)));
                         } else {
