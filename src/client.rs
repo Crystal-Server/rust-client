@@ -155,6 +155,9 @@ struct StreamData {
     syncs: Vec<Option<SelfSync>>,
     syncs_remove: Vec<usize>,
 
+    game_master: Option<u64>,
+    session_master: Option<u64>,
+
     ping: f64,
     last_ping: Option<Instant>,
 
@@ -423,7 +426,7 @@ enum ReadPacket {
     Login(LoginCode),
     /// Login Code
     LoginBan(LoginCode),
-    /// Player ID, Player Name, Token, Savefile, Friends, Incoming Friends, Outgoing Friends, Game Achievements
+    /// Player ID, Player Name, Token, Savefile, Friends, Incoming Friends, Outgoing Friends, Game Achievements, Game Master, Session Master
     LoginOk(
         u64,
         String,
@@ -433,6 +436,8 @@ enum ReadPacket {
         IntSet<Leb<u64>>,
         IntSet<Leb<u64>>,
         IntMap<Leb<u64>, Achievement>,
+        u64,
+        u64,
     ),
     /// Player ID, Player Name, Player Variables, Player Syncs, Room
     PlayerLoggedIn(
@@ -501,6 +506,10 @@ enum ReadPacket {
     ExistsBdb(u64, bool),
     /// Callback Index, Status
     SetBdb(u64, SetBdbFile),
+    /// Player ID
+    SetGameMaster(u64),
+    /// Player ID
+    SetSessionMaster(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -808,6 +817,11 @@ impl CrystalServer {
                                             }
                                         }
                                         ReadPacket::ForceDisconnection() => {
+                                            {
+                                                let mut dlock = data.write().await;
+                                                dlock.game_master = None;
+                                                dlock.session_master = None;
+                                            }
                                             return Err(Error::new(
                                                 ErrorKind::BrokenPipe,
                                                 "forced disconnection registered",
@@ -840,8 +854,12 @@ impl CrystalServer {
                                             incoming_friends,
                                             outgoing_friends,
                                             game_achievements,
+                                            game_master,
+                                            session_master,
                                         ) => {
                                             let mut dlock = data.write().await;
+                                            dlock.game_master = Some(game_master);
+                                            dlock.session_master = Some(session_master);
                                             dlock.player_id = Some(pid);
                                             dlock.player_name = Some(pname.clone());
                                             dlock.player_save = savefile;
@@ -1059,6 +1077,8 @@ impl CrystalServer {
                                                 }
                                             }
                                             dlock.players.clear();
+                                            dlock.game_master = None;
+                                            dlock.session_master = None;
                                         }
                                         ReadPacket::GameIniWrite(upds) => {
                                             let mut dlock = data.write().await;
@@ -1442,6 +1462,20 @@ impl CrystalServer {
                                                 }
                                             }
                                         }
+                                        ReadPacket::SetGameMaster(pid) => {
+                                            let mut dlock = data.write().await;
+                                            dlock.game_master = Some(pid);
+                                            if let Some(dup) = dlock.func_data_update.as_mut() {
+                                                dup(DataUpdate::ChangeGameMaster(pid));
+                                            }
+                                        }
+                                        ReadPacket::SetSessionMaster(pid) => {
+                                            let mut dlock = data.write().await;
+                                            dlock.session_master = Some(pid);
+                                            if let Some(dup) = dlock.func_data_update.as_mut() {
+                                                dup(DataUpdate::ChangeSessionMaster(pid));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1692,6 +1726,8 @@ impl CrystalServer {
                         let incoming_friends = b.read()?;
                         let outgoing_friends = b.read()?;
                         let achievements = b.read()?;
+                        let game_master = b.read_leb_u64()?;
+                        let session_master = b.read_leb_u64()?;
                         Ok(ReadPacket::LoginOk(
                             pid,
                             name,
@@ -1701,6 +1737,8 @@ impl CrystalServer {
                             incoming_friends,
                             outgoing_friends,
                             achievements,
+                            game_master,
+                            session_master,
                         ))
                     }
                     1 /*NoUser*/ => Ok(ReadPacket::Login(LoginCode::NoUser)),
@@ -1866,6 +1904,8 @@ impl CrystalServer {
                     SetBdbFile::try_from_primitive(b.read_u8()?).unwrap_or(SetBdbFile::Error);
                 ReadPacket::SetBdb(index, status)
             }),
+            30 => Ok(ReadPacket::SetGameMaster(b.read_leb_u64()?)),
+            31 => Ok(ReadPacket::SetSessionMaster(b.read_leb_u64()?)),
             _ => Err(Error::new(
                 ErrorKind::InvalidData,
                 format!("unknown event {event}, erroring out"),
@@ -3222,5 +3262,15 @@ impl CrystalServer {
             ))
             .await;
         }
+    }
+
+    /// Obtain the first player that joined the game (that's still online).
+    pub async fn get_game_master(&self) -> Option<u64> {
+        self.data.read().await.game_master
+    }
+
+    /// Obtain the first player that joined the current session (that's still online).
+    pub async fn get_session_master(&self) -> Option<u64> {
+        self.data.read().await.session_master
     }
 }

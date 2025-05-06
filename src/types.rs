@@ -176,6 +176,10 @@ pub enum DataUpdate {
     Banned(String, DateTime<Utc>),
     /// Notification Message
     ServerNotification(String),
+    /// Player ID
+    ChangeGameMaster(u64),
+    /// Player ID
+    ChangeSessionMaster(u64),
 }
 
 /// The return success value of a registration attempt
