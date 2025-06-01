@@ -148,6 +148,8 @@ struct StreamData {
     game_administrators: IntMap<Leb<u64>, Administrator>,
     game_version: f64,
 
+    global_variables: HashMap<String, Value>,
+
     players: IntMap<u64, Player>,
     players_logout: IntSet<u64>,
     player_queue: IntMap<u64, PlayerQueue>,
@@ -165,6 +167,7 @@ struct StreamData {
     update_variable: HashSet<String>,
     update_playerini: HashSet<String>,
     update_gameini: HashSet<String>,
+    update_globalvari: HashSet<String>,
     call_disconnected: bool,
 
     callback_server_update: IntMap<u64, Option<CallbackServerUpdate>>,
@@ -227,6 +230,7 @@ impl StreamData {
         self.new_sync_queue.clear();
         self.update_variable.clear();
         self.update_playerini.clear();
+        self.update_globalvari.clear();
         self.callback_server_update.clear();
         self.callback_server_index = 0;
         self.players.clear();
@@ -426,7 +430,7 @@ enum ReadPacket {
     Login(LoginCode),
     /// Login Code
     LoginBan(LoginCode),
-    /// Player ID, Player Name, Token, Savefile, Friends, Incoming Friends, Outgoing Friends, Game Achievements, Game Master, Session Master
+    /// Player ID, Player Name, Token, Savefile, Friends, Incoming Friends, Outgoing Friends, Game Achievements, Game Master, Session Master, Global Variables
     LoginOk(
         u64,
         String,
@@ -438,6 +442,7 @@ enum ReadPacket {
         IntMap<Leb<u64>, Achievement>,
         u64,
         u64,
+        HashMap<String, Value>,
     ),
     /// Player ID, Player Name, Player Variables, Player Syncs, Room
     PlayerLoggedIn(
@@ -510,6 +515,8 @@ enum ReadPacket {
     SetGameMaster(u64),
     /// Player ID
     SetSessionMaster(u64),
+    /// Name, Value
+    SetGlobalVariable(String, OptionalValue),
 }
 
 #[derive(Debug, Clone)]
@@ -570,6 +577,8 @@ enum WritePacket {
     PacketCrunch(Vec<WritePacket>),
     /// Callback Index, BDB Name
     ExistsBdb(u64, String),
+    /// Name, Value
+    GlobalVariableWrite(Vec<VariableUpdate>),
 }
 
 impl CrystalServer {
@@ -606,7 +615,7 @@ impl CrystalServer {
         let url = if let Some(url) = self.data.read().await.last_host.clone() {
             url
         } else if cfg!(feature = "__local") {
-            String::from("ws://localhost:16562")
+            String::from("ws://localhost:16559")
         } else {
             String::from("ws://server.crystal-server.co:16562")
         };
@@ -856,6 +865,7 @@ impl CrystalServer {
                                             game_achievements,
                                             game_master,
                                             session_master,
+                                            global_variables,
                                         ) => {
                                             let mut dlock = data.write().await;
                                             dlock.game_master = Some(game_master);
@@ -870,6 +880,7 @@ impl CrystalServer {
                                                 IntSet::from_iter(incoming_friends.iter().map(|pid| **pid));
                                             dlock.player_outgoing_friends =
                                                 IntSet::from_iter(outgoing_friends.iter().map(|pid| **pid));
+                                            dlock.global_variables = global_variables;
                                             dlock.is_loggedin = true;
                                             if let Some(log) = &mut dlock.func_login {
                                                 log(LoginCode::Ok(token.clone()));
@@ -1476,6 +1487,14 @@ impl CrystalServer {
                                                 dup(DataUpdate::ChangeSessionMaster(pid));
                                             }
                                         }
+                                        ReadPacket::SetGlobalVariable(name, value) => {
+                                            let mut dlock = data.write().await;
+                                            if let OptionalValue::Some(value) = value {
+                                                dlock.global_variables.insert(name, value);
+                                            } else {
+                                                dlock.global_variables.remove(&name);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1698,6 +1717,10 @@ impl CrystalServer {
                 b.write_leb_u64(*index)?;
                 b.write_string(name)?;
             }
+            WritePacket::GlobalVariableWrite(updates) => {
+                b.write_u8(25)?;
+                b.write(updates)?;
+            }
         }
         Ok(b)
     }
@@ -1728,6 +1751,7 @@ impl CrystalServer {
                         let achievements = b.read()?;
                         let game_master = b.read_leb_u64()?;
                         let session_master = b.read_leb_u64()?;
+                        let global_variables = b.read()?;
                         Ok(ReadPacket::LoginOk(
                             pid,
                             name,
@@ -1739,6 +1763,7 @@ impl CrystalServer {
                             achievements,
                             game_master,
                             session_master,
+                            global_variables,
                         ))
                     }
                     1 /*NoUser*/ => Ok(ReadPacket::Login(LoginCode::NoUser)),
@@ -1906,6 +1931,11 @@ impl CrystalServer {
             }),
             30 => Ok(ReadPacket::SetGameMaster(b.read_leb_u64()?)),
             31 => Ok(ReadPacket::SetSessionMaster(b.read_leb_u64()?)),
+            32 => Ok({
+                let name = b.read_string()?;
+                let value = b.read()?;
+                ReadPacket::SetGlobalVariable(name, value)
+            }),
             _ => Err(Error::new(
                 ErrorKind::InvalidData,
                 format!("unknown event {event}, erroring out"),
@@ -2111,6 +2141,16 @@ impl CrystalServer {
                     data.push(VariableUpdate { name, value });
                 }
                 self.internal_iosend(WritePacket::PlayerIniWrite(data))
+                    .await;
+            }
+            if !dlock.update_globalvari.is_empty() {
+                let mut data: Vec<VariableUpdate> = Vec::new();
+                let variupds = dlock.update_globalvari.drain().collect::<Vec<String>>();
+                for name in variupds {
+                    let value = dlock.global_variables.get(&name).cloned().into();
+                    data.push(VariableUpdate { name, value });
+                }
+                self.internal_iosend(WritePacket::GlobalVariableWrite(data))
                     .await;
             }
             if !dlock.update_gameini.is_empty() {
@@ -3272,5 +3312,38 @@ impl CrystalServer {
     /// Obtain the first player that joined the current session (that's still online).
     pub async fn get_session_master(&self) -> Option<u64> {
         self.data.read().await.session_master
+    }
+
+    /// Checks if the requested variable exist in the global variable list.
+    pub async fn has_globalvari(&self, name: &str) -> bool {
+        let dlock = self.data.read().await;
+        dlock.global_variables.contains_key(name)
+    }
+
+    /// Returns the saved value in the section & key of the currently open gameini file.
+    /// If the value is not found, it returns [None].
+    pub async fn get_globalvari(&self, name: &str) -> Option<Value> {
+        let dlock = self.data.read().await;
+        dlock.game_save.get(name).cloned()
+    }
+
+    /// Saves a new value for the requested section & key of the currently open gameini file.
+    pub async fn set_globalvari(&self, name: &str, value: Value) {
+        let mut dlock = self.data.write().await;
+        if let Some(orgvalue) = dlock.global_variables.get(name) {
+            if value == *orgvalue {
+                return;
+            }
+        }
+        dlock.game_save.insert(name.to_owned(), value.clone());
+        dlock.update_globalvari.insert(name.to_owned());
+    }
+
+    /// Removes the saved value for the requested section & key of the currently open gameini file.
+    pub async fn remove_globalvari(&self, name: &str) {
+        let mut dlock = self.data.write().await;
+        if dlock.game_save.remove(name).is_some() {
+            dlock.update_globalvari.insert(name.to_owned());
+        }
     }
 }
