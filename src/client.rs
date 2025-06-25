@@ -14,14 +14,10 @@ use super::{
         SyncUpdate, SyncVariableServerUpdate, Value, VariableUpdate,
     },
 };
-use age::{
-    Decryptor, Encryptor,
-    x25519::{Identity, Recipient},
-};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::{
-    AsyncReadExt, AsyncWriteExt, SinkExt, Stream, StreamExt,
+    SinkExt, Stream, StreamExt,
     stream::{SplitSink, SplitStream},
 };
 use integer_hasher::{IntMap, IntSet};
@@ -30,8 +26,6 @@ use num_enum::TryFromPrimitive;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{Cursor, Error, ErrorKind, Result as IoResult},
-    iter,
-    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -92,14 +86,10 @@ struct StreamHandler;
 
 struct StreamReader {
     stream: Option<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
-
-    pub identity: Option<Identity>,
 }
 
 struct StreamWriter {
     stream: Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,
-
-    pub recipient: Option<Recipient>,
 }
 
 type CallbackRoom = Box<dyn FnMut() -> String + Sync + Send>;
@@ -261,13 +251,9 @@ impl StreamHandler {
         (
             StreamReader {
                 stream: Some(split.1),
-
-                identity: None,
             },
             StreamWriter {
                 stream: Some(split.0),
-
-                recipient: None,
             },
         )
     }
@@ -281,35 +267,7 @@ impl StreamReader {
                 if frame.is_binary() {
                     let data = frame.into_data();
                     if !data.is_empty() {
-                        if let Some(identity) = &self.identity {
-                            let len = data.len();
-                            if let Ok(decryptor) =
-                                Decryptor::new_async_buffered(data.to_vec().as_slice()).await
-                            {
-                                if let Ok(mut reader) =
-                                    decryptor.decrypt_async(iter::once(identity as _))
-                                {
-                                    let mut output = Vec::with_capacity(len);
-                                    if reader.read_to_end(&mut output).await.is_ok() {
-                                        Ok(Buffer::new(Cursor::new(output)))
-                                    } else {
-                                        Err(ReaderError::Unknown(String::from(
-                                            "decryptor reader errored out while reading",
-                                        )))
-                                    }
-                                } else {
-                                    Err(ReaderError::Unknown(String::from(
-                                        "unable to make decryptor reader",
-                                    )))
-                                }
-                            } else {
-                                Err(ReaderError::Unknown(String::from(
-                                    "unable to make decryptor",
-                                )))
-                            }
-                        } else {
-                            Ok(Buffer::new(Cursor::new(data.to_vec())))
-                        }
+                        Ok(Buffer::new(Cursor::new(data.to_vec())))
                     } else {
                         Err(ReaderError::StreamEmpty(format!(
                             "tried to read {} byte(s) from ws",
@@ -347,44 +305,19 @@ impl StreamReader {
 
 impl StreamWriter {
     #[inline(always)]
-    pub async fn prepare_buffer(&self, mut buffer: Buffer) -> IoResult<Buffer> {
-        if let Some(recipient) = &self.recipient {
-            let encryptor = Encryptor::with_recipients(iter::once(recipient as _))
-                .expect("unable to make encryptor");
-            let mut output = Vec::with_capacity(buffer.len()? as usize);
-            let mut writer = encryptor.wrap_async_output(&mut output).await?;
-            writer.write_all(buffer.container.get_ref()).await?;
-            writer.flush().await?;
-            writer.close().await?;
-            buffer.container = Cursor::new(output);
-        }
-        Ok(buffer)
-    }
-
-    #[inline(always)]
-    pub async fn write(&mut self, data: Buffer) -> Result<(), WriterError> {
-        if let Ok(mut data) = self.prepare_buffer(data).await {
-            self.write_raw(&mut data).await
-        } else {
-            Err(WriterError::StreamError(String::from(
-                "unable to fetch new buffer",
-            )))
-        }
-    }
-
-    #[inline(always)]
-    pub async fn write_raw(&mut self, data: &mut Buffer) -> Result<(), WriterError> {
+    pub async fn write(&mut self, data: &Buffer) -> Result<(), WriterError> {
         /*#[cfg(feature = "__dev")]
         info!("wrote data: {:?}", data.container.get_ref().to_str_lossy());*/
-        let data = data.container.get_ref().clone();
         if let Some(stream) = self.stream.as_mut() {
             unwrap_return!(
                 stream
-                    .send(Message::Binary(Bytes::copy_from_slice(&data)))
+                    .send(Message::Binary(Bytes::copy_from_slice(
+                        data.container.get_ref()
+                    )))
                     .await,
                 Err(WriterError::StreamError(format!(
                     "unable to write {:?} byte(s) to a ws",
-                    data.len(),
+                    data.container.get_ref().len(),
                 )))
             );
             unwrap_return!(
@@ -500,7 +433,7 @@ enum ReadPacket {
     RequestBdb(u64, Option<Vec<u8>>, Option<BdbPermission>),
     /// Change Friend Status, Player ID
     ChangeFriendStatus(ChangeFriendStatus, u64),
-    Handshake(Option<String>),
+    Handshake(),
     /// Message
     ServerMessage(String),
     /// Target Host
@@ -571,8 +504,6 @@ enum WritePacket {
     SetBdb(u64, String, Vec<u8>, Option<BdbFilePermissions>),
     /// Change Friend Status, Player ID
     RequestChangeFriendStatus(ChangeFriendStatus, u64),
-    /// Key
-    Handshake(String),
     /// Packets
     PacketCrunch(Vec<WritePacket>),
     /// Callback Index, BDB Name
@@ -678,7 +609,7 @@ impl CrystalServer {
                         writer
                             .lock()
                             .await
-                            .write(Self::get_packet_write(&$packet)?)
+                            .write(&Self::get_packet_write(&$packet)?)
                             .await,
                         Err(Error::from(ErrorKind::BrokenPipe))
                     );
@@ -737,66 +668,32 @@ impl CrystalServer {
                                         ReadPacket::PacketCrunch(rpack) => {
                                             packets.extend(rpack);
                                         }
-                                        ReadPacket::Handshake(key) => {
-                                            if let Some(key) = key {
-                                                let encode_read = Identity::generate();
-                                                let encodepub_read = encode_read.to_public();
-                                                reader.identity = Some(encode_read);
-                                                match Recipient::from_str(&key) {
-                                                    Ok(key) => {
-                                                        {
-                                                            let mut dlock = data.write().await;
-                                                            dlock.is_connecting = false;
-                                                            dlock.is_reconnecting = false;
-                                                            dlock.is_connected = true;
-                                                        }
-                                                        writer.lock().await.recipient = Some(key);
-                                                    }
-                                                    Err(_e) => {
-                                                        #[cfg(feature = "__dev")]
-                                                        warn!("error while parsing key: {_e:?}");
-                                                        {
-                                                            let mut dlock = data.write().await;
-                                                            dlock.clear(true).await;
-                                                            dlock.registered_errors.push(
-                                                                ClientError::HandlerResultString(String::from(
-                                                                    "unable to set write key for data writer",
-                                                                )),
-                                                            );
-                                                        }
-                                                        return Ok(());
-                                                    }
-                                                }
-                                                write_packet!(WritePacket::Handshake(
-                                                    encodepub_read.to_string(),
-                                                ));
+                                        ReadPacket::Handshake() => {
+                                            let hwid = if let Ok(hwid) =
+                                                IdBuilder::new(Encryption::SHA256)
+                                                    .add_component(HWIDComponent::CPUID)
+                                                    .add_component(HWIDComponent::MacAddress)
+                                                    .add_component(HWIDComponent::SystemID)
+                                                    .build(None)
+                                            {
+                                                hwid
                                             } else {
-                                                let hwid = if let Ok(hwid) =
-                                                    IdBuilder::new(Encryption::SHA256)
-                                                        .add_component(HWIDComponent::CPUID)
-                                                        .add_component(HWIDComponent::MacAddress)
-                                                        .add_component(HWIDComponent::SystemID)
-                                                        .build(None)
-                                                {
-                                                    hwid
-                                                } else {
-                                                    return Err(Error::from(ErrorKind::InvalidData));
-                                                };
-                                                let dlock = data.read().await;
-                                                write_packet!(WritePacket::InitializationHandshake(
-                                                    [
-                                                        0x3a0b1a04c51a2811,
-                                                        0x97a18f1dc9ee891d,
-                                                        0xfc7eb64f732a37fd,
-                                                        0xbe65cbabde15c305,
-                                                    ],
-                                                    1,
-                                                    hwid,
-                                                    dlock.game_id.clone(),
-                                                    dlock.version,
-                                                    dlock.session.clone()
-                                                ));
-                                            }
+                                                return Err(Error::from(ErrorKind::InvalidData));
+                                            };
+                                            let dlock = data.read().await;
+                                            write_packet!(WritePacket::InitializationHandshake(
+                                                [
+                                                    0x3a0b1a04c51a2811,
+                                                    0x97a18f1dc9ee891d,
+                                                    0xfc7eb64f732a37fd,
+                                                    0xbe65cbabde15c305,
+                                                ],
+                                                1,
+                                                hwid,
+                                                dlock.game_id.clone(),
+                                                dlock.version,
+                                                dlock.session.clone()
+                                            ));
                                         }
                                         ReadPacket::SyncGameInfo(
                                             game_save,
@@ -1701,10 +1598,10 @@ impl CrystalServer {
                 b.write_u8(*status as u8)?;
                 b.write_leb_u64(*pid)?;
             }
-            WritePacket::Handshake(key) => {
+            /*WritePacket::Handshake(key) => {
                 b.write_u8(22)?;
                 b.write_string(key)?;
-            }
+            }*/
             WritePacket::PacketCrunch(packets) => {
                 b.write_u8(23)?;
                 b.write_leb_u64(packets.len() as u64)?;
@@ -1908,7 +1805,7 @@ impl CrystalServer {
                 let pid = b.read_leb_u64()?;
                 Ok(ReadPacket::ChangeFriendStatus(status, pid))
             }
-            24 => Ok(ReadPacket::Handshake(b.read()?)),
+            24 => Ok(ReadPacket::Handshake()),
             25 => Ok(ReadPacket::ServerMessage(b.read_string()?)),
             26 => Ok(ReadPacket::ChangeConnection(b.read_string()?)),
             27 => Ok({

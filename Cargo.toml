@@ -24,13 +24,13 @@ __local = []
 
 [dependencies]
 bstr = "1.12.0"
-num_enum = "0.7.3"
+num_enum = "0.7.4"
 chrono = "0.4.41"
 byteorder = "1.5.0"
 integer-hasher = "0.1.1"
 tracing = { version = "0.1.41", optional = true }
 tracing-subscriber = { version = "0.3.19", optional = true }
-tokio-tungstenite = "0.26.2"
+tokio-tungstenite = "0.27.0"
 tokio = { version = "1.45.1", features = [
     "net",
     "rt",
@@ -39,8 +39,7 @@ tokio = { version = "1.45.1", features = [
     "macros",
 ] }
 bytes = "1.10.1"
-futures-util = "0.3.31"
-age = { version = "0.11.1", features = ["async"] }
+futures-util = { version = "0.3.31", features = ["io"] }
 machineid-crystal = "1.2.6"
 async-stream = "0.3.6"
 urlencoding = "2.1.3"
