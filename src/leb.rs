@@ -91,10 +91,3 @@ impl<T: Into<u64> + Copy + PartialEq + Eq> PartialOrd for Leb<T> {
         Some(self.0.into().cmp(&other.0.into()))
     }
 }
-
-impl<T: Into<u64> + Copy + PartialEq + Eq> Ord for Leb<T> {
-    #[inline(always)]
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.into().cmp(&other.0.into())
-    }
-}

@@ -928,8 +928,7 @@ impl CrystalServer {
                                             for slot in exists {
                                                 if let Some(upd) =
                                                     upds.iter().find(|supd| supd.slot == slot)
-                                                {
-                                                    if let Some(dup) = &mut dlock.func_data_update {
+                                                    && let Some(dup) = &mut dlock.func_data_update {
                                                         if let Some(vari) = &upd.variables {
                                                             for (vname, value) in vari {
                                                                 dup(DataUpdate::UpdateSyncVariable(
@@ -943,15 +942,13 @@ impl CrystalServer {
                                                             dup(DataUpdate::UpdateSyncRemoval(pid, slot));
                                                         }
                                                     }
-                                                }
                                             }
                                             for pid in add_pq {
                                                 for upd in &upds {
-                                                    if let Some(player) = dlock.players.get(&pid) {
-                                                        if let Some(Some(_)) = player.syncs.get(upd.slot) {
+                                                    if let Some(player) = dlock.players.get(&pid)
+                                                        && let Some(Some(_)) = player.syncs.get(upd.slot) {
                                                             continue;
                                                         }
-                                                    }
                                                     dlock
                                                         .player_queue
                                                         .entry(pid)
@@ -1113,8 +1110,7 @@ impl CrystalServer {
                                                 .callback_server_update
                                                 .get_mut(&index)
                                                 .map(|csu| csu.take())
-                                            {
-                                                if let ServerUpdateCallback::PlayerVariable(callback, pid) =
+                                                && let ServerUpdateCallback::PlayerVariable(callback, pid) =
                                                     csu.callback
                                                 {
                                                     Self::iter_missing_data(&mut dlock, pid).await?;
@@ -1131,7 +1127,6 @@ impl CrystalServer {
                                                         callback(pid, csu.name, vari);
                                                     }
                                                 }
-                                            }
                                         }
                                         ReadPacket::AdminAction(aa) => {
                                             let mut dlock = data.write().await;
@@ -1174,8 +1169,7 @@ impl CrystalServer {
                                             let mut dlock = data.write().await;
                                             if let Some(Some(csu)) =
                                                 dlock.callback_server_update.remove(&index)
-                                            {
-                                                if let ServerUpdateCallback::SyncVariable(
+                                                && let ServerUpdateCallback::SyncVariable(
                                                     callback,
                                                     pid,
                                                     slot,
@@ -1198,8 +1192,8 @@ impl CrystalServer {
                                                     } else {
                                                         false
                                                     };
-                                                    if obtained {
-                                                        if let Some(dup) = &mut dlock.func_data_update {
+                                                    if obtained
+                                                        && let Some(dup) = &mut dlock.func_data_update {
                                                             dup(DataUpdate::UpdateSyncVariable(
                                                                 pid,
                                                                 slot,
@@ -1207,12 +1201,10 @@ impl CrystalServer {
                                                                 vari.clone(),
                                                             ));
                                                         }
-                                                    }
                                                     if let Some(mut callback) = callback {
                                                         callback(pid, csu.name, vari);
                                                     }
                                                 }
-                                            }
                                         }
                                         ReadPacket::ChangeGameVersion(ver) => {
                                             let mut dlock = data.write().await;
@@ -1356,19 +1348,17 @@ impl CrystalServer {
                                         }
                                         ReadPacket::ExistsBdb(index, exists) => {
                                             let mut dlock = data.write().await;
-                                            if let Some(Some(csu)) = dlock.callback_server_update.remove(&index) {
-                                                if let ServerUpdateCallback::ExistsBdb(Some(mut callback)) = csu.callback {
+                                            if let Some(Some(csu)) = dlock.callback_server_update.remove(&index)
+                                                && let ServerUpdateCallback::ExistsBdb(Some(mut callback)) = csu.callback {
                                                     callback(csu.name, exists);
                                                 }
-                                            }
                                         }
                                         ReadPacket::SetBdb(index, status) => {
                                             let mut dlock = data.write().await;
-                                            if let Some(Some(csu)) = dlock.callback_server_update.remove(&index) {
-                                                if let ServerUpdateCallback::WriteBdb(Some(mut callback)) = csu.callback {
+                                            if let Some(Some(csu)) = dlock.callback_server_update.remove(&index)
+                                                && let ServerUpdateCallback::WriteBdb(Some(mut callback)) = csu.callback {
                                                     callback(csu.name, status);
                                                 }
-                                            }
                                         }
                                         ReadPacket::SetGameMaster(pid) => {
                                             let mut dlock = data.write().await;
@@ -1842,60 +1832,59 @@ impl CrystalServer {
 
     #[inline(always)]
     async fn iter_missing_data(data: &mut StreamData, pid: u64) -> IoResult<()> {
-        if let Some(pq) = data.player_queue.get_mut(&pid) {
-            if let Some(player) = data.players.get_mut(&pid) {
-                for (name, value) in pq.variables.drain() {
-                    if let OptionalValue::Some(value) = value {
-                        player.variables.insert(name, value);
-                    } else {
-                        player.variables.remove(&name);
-                    }
+        if let Some(pq) = data.player_queue.get_mut(&pid)
+            && let Some(player) = data.players.get_mut(&pid)
+        {
+            for (name, value) in pq.variables.drain() {
+                if let OptionalValue::Some(value) = value {
+                    player.variables.insert(name, value);
+                } else {
+                    player.variables.remove(&name);
                 }
-                for (index, osync) in player.syncs.iter_mut().enumerate() {
-                    if osync.is_none() {
-                        if let Some((sni, sn)) = pq
-                            .new_syncs
-                            .iter()
-                            .enumerate()
-                            .find(|(_, sn)| sn.slot == index)
-                        {
-                            *osync = Some(types::Sync {
-                                event: SyncEvent::New,
-                                kind: sn.kind,
-                                sync_type: sn.sync_type,
-                                variables: sn.variables.clone(),
-                                is_ending: false,
-                            });
-                            pq.new_syncs.remove(sni);
-                        }
+            }
+            for (index, osync) in player.syncs.iter_mut().enumerate() {
+                if osync.is_none()
+                    && let Some((sni, sn)) = pq
+                        .new_syncs
+                        .iter()
+                        .enumerate()
+                        .find(|(_, sn)| sn.slot == index)
+                {
+                    *osync = Some(types::Sync {
+                        event: SyncEvent::New,
+                        kind: sn.kind,
+                        sync_type: sn.sync_type,
+                        variables: sn.variables.clone(),
+                        is_ending: false,
+                    });
+                    pq.new_syncs.remove(sni);
+                }
+                if let Some(sync) = osync {
+                    if let Some((sni, _)) = pq
+                        .new_syncs
+                        .iter()
+                        .enumerate()
+                        .find(|(_, sn)| sn.slot == index)
+                    {
+                        pq.new_syncs.remove(sni);
                     }
-                    if let Some(sync) = osync {
-                        if let Some((sni, _)) = pq
-                            .new_syncs
-                            .iter()
-                            .enumerate()
-                            .find(|(_, sn)| sn.slot == index)
-                        {
-                            pq.new_syncs.remove(sni);
-                        }
-                        if let Some(is) = pq.syncs.remove(&index) {
-                            for (name, value) in is {
-                                if let OptionalValue::Some(value) = value {
-                                    sync.variables.insert(name, value);
-                                } else {
-                                    sync.variables.remove(&name);
-                                }
+                    if let Some(is) = pq.syncs.remove(&index) {
+                        for (name, value) in is {
+                            if let OptionalValue::Some(value) = value {
+                                sync.variables.insert(name, value);
+                            } else {
+                                sync.variables.remove(&name);
                             }
                         }
-                        if let Some((index, _)) = pq
-                            .remove_syncs
-                            .iter()
-                            .enumerate()
-                            .find(|(rindex, _)| *rindex == index)
-                        {
-                            sync.is_ending = true;
-                            pq.remove_syncs.remove(index);
-                        }
+                    }
+                    if let Some((index, _)) = pq
+                        .remove_syncs
+                        .iter()
+                        .enumerate()
+                        .find(|(rindex, _)| *rindex == index)
+                    {
+                        sync.is_ending = true;
+                        pq.remove_syncs.remove(index);
                     }
                 }
             }
@@ -1965,24 +1954,24 @@ impl CrystalServer {
             if !dlock.syncs.is_empty() || !dlock.syncs_remove.is_empty() {
                 let mut upds = Vec::new();
                 for (index, sync) in dlock.syncs.iter_mut().enumerate() {
-                    if let Some(sync) = sync {
-                        if !sync.to_sync.is_empty() {
-                            #[cfg(feature = "__dev")]
-                            info!(
-                                "updating sync variables on slot {index}: {:?}",
-                                sync.to_sync
-                            );
-                            let mut variupd = HashMap::new();
-                            for upd in sync.to_sync.drain() {
-                                let vari = sync.variables.get(&upd).cloned().into();
-                                variupd.insert(upd, vari);
-                            }
-                            upds.push(SyncUpdate {
-                                slot: index,
-                                remove_sync: false,
-                                variables: Some(variupd),
-                            });
+                    if let Some(sync) = sync
+                        && !sync.to_sync.is_empty()
+                    {
+                        #[cfg(feature = "__dev")]
+                        info!(
+                            "updating sync variables on slot {index}: {:?}",
+                            sync.to_sync
+                        );
+                        let mut variupd = HashMap::new();
+                        for upd in sync.to_sync.drain() {
+                            let vari = sync.variables.get(&upd).cloned().into();
+                            variupd.insert(upd, vari);
                         }
+                        upds.push(SyncUpdate {
+                            slot: index,
+                            remove_sync: false,
+                            variables: Some(variupd),
+                        });
                     }
                 }
                 for remove in dlock.syncs_remove.drain(..) {
@@ -2059,18 +2048,18 @@ impl CrystalServer {
                 }
                 self.internal_iosend(WritePacket::GameIniWrite(data)).await;
             }
-            if let Some(ping) = dlock.last_ping {
-                if ping.elapsed().as_secs_f64() >= 90.0 {
-                    drop(dlock);
-                    self.disconnect().await;
-                    {
-                        let mut dlock = self.data.write().await;
-                        if let Some(func) = dlock.func_disconnected.as_mut() {
-                            func(DisconnectionType::Disconnected);
-                        }
-                        if let Some(dup) = dlock.func_data_update.as_mut() {
-                            dup(DataUpdate::Disconnected);
-                        }
+            if let Some(ping) = dlock.last_ping
+                && ping.elapsed().as_secs_f64() >= 90.0
+            {
+                drop(dlock);
+                self.disconnect().await;
+                {
+                    let mut dlock = self.data.write().await;
+                    if let Some(func) = dlock.func_disconnected.as_mut() {
+                        func(DisconnectionType::Disconnected);
+                    }
+                    if let Some(dup) = dlock.func_data_update.as_mut() {
+                        dup(DataUpdate::Disconnected);
                     }
                 }
             }
@@ -2284,10 +2273,10 @@ impl CrystalServer {
     /// Sets a variable with the name and value provided.
     pub async fn set_variable(&self, name: &str, value: Value) {
         let mut dlock = self.data.write().await;
-        if let Some(orgvalue) = dlock.variables.get(name) {
-            if value == *orgvalue {
-                return;
-            }
+        if let Some(orgvalue) = dlock.variables.get(name)
+            && value == *orgvalue
+        {
+            return;
         }
         dlock.variables.insert(name.to_owned(), value);
         dlock.update_variable.insert(name.to_owned());
@@ -2476,10 +2465,10 @@ impl CrystalServer {
     pub async fn set_playerini(&self, section: &str, key: &str, value: Value) {
         let mut dlock = self.data.write().await;
         let save_key = Self::get_save_key(&dlock.player_open_save, section, key);
-        if let Some(orgvalue) = dlock.player_save.get(&save_key) {
-            if value == *orgvalue {
-                return;
-            }
+        if let Some(orgvalue) = dlock.player_save.get(&save_key)
+            && value == *orgvalue
+        {
+            return;
         }
         dlock.player_save.insert(save_key.clone(), value.clone());
         dlock.update_playerini.insert(save_key);
@@ -2532,10 +2521,10 @@ impl CrystalServer {
     pub async fn set_gameini(&self, section: &str, key: &str, value: Value) {
         let mut dlock = self.data.write().await;
         let save_key = Self::get_save_key(&dlock.game_open_save, section, key);
-        if let Some(orgvalue) = dlock.game_save.get(&save_key) {
-            if value == *orgvalue {
-                return;
-            }
+        if let Some(orgvalue) = dlock.game_save.get(&save_key)
+            && value == *orgvalue
+        {
+            return;
         }
         dlock.game_save.insert(save_key.clone(), value.clone());
         dlock.update_gameini.insert(save_key);
@@ -2603,12 +2592,12 @@ impl CrystalServer {
     pub async fn reach_achievement(&self, aid: u64) {
         if !self.has_reached_achievement(aid).await {
             let mut dlock = self.data.write().await;
-            if dlock.player_id.is_some() {
-                if let Some(achievement) = dlock.game_achievements.get_mut(&Leb(aid)) {
-                    achievement.unlocked = Some(Utc::now().timestamp());
-                    self.internal_iosend(WritePacket::UpdateAchievement(aid))
-                        .await;
-                }
+            if dlock.player_id.is_some()
+                && let Some(achievement) = dlock.game_achievements.get_mut(&Leb(aid))
+            {
+                achievement.unlocked = Some(Utc::now().timestamp());
+                self.internal_iosend(WritePacket::UpdateAchievement(aid))
+                    .await;
             }
         }
     }
@@ -2665,19 +2654,19 @@ impl CrystalServer {
     /// Records a new player score on the specified highscore.
     pub async fn set_score_highscore(&self, hid: u64, score: f64) -> IoResult<()> {
         let mut dlock = self.data.write().await;
-        if let Some(player_id) = dlock.player_id {
-            if let Some(highscore) = dlock.game_highscores.get_mut(&Leb(hid)) {
-                if let Some(hscore) = highscore.scores.get_mut(&Leb(player_id)) {
-                    if *hscore != score {
-                        *hscore = score;
-                        self.internal_iosend(WritePacket::UpdateHighscore(hid, score))
-                            .await;
-                    }
-                } else {
-                    highscore.scores.insert(Leb(player_id), score);
+        if let Some(player_id) = dlock.player_id
+            && let Some(highscore) = dlock.game_highscores.get_mut(&Leb(hid))
+        {
+            if let Some(hscore) = highscore.scores.get_mut(&Leb(player_id)) {
+                if *hscore != score {
+                    *hscore = score;
                     self.internal_iosend(WritePacket::UpdateHighscore(hid, score))
                         .await;
                 }
+            } else {
+                highscore.scores.insert(Leb(player_id), score);
+                self.internal_iosend(WritePacket::UpdateHighscore(hid, score))
+                    .await;
             }
         }
         Ok(())
@@ -2728,10 +2717,10 @@ impl CrystalServer {
     pub async fn set_variable_sync(&self, sync: usize, name: &str, value: Value) {
         let mut dlock = self.data.write().await;
         if let Some(Some(sync)) = dlock.syncs.get_mut(sync) {
-            if let Some(orgvalue) = sync.variables.get(name) {
-                if value == *orgvalue {
-                    return;
-                }
+            if let Some(orgvalue) = sync.variables.get(name)
+                && value == *orgvalue
+            {
+                return;
             }
             sync.variables.insert(name.to_owned(), value);
             sync.to_sync.insert(name.to_owned());
@@ -2741,10 +2730,10 @@ impl CrystalServer {
     /// Remove a sync variable with the specified name.
     pub async fn remove_variable_sync(&self, sync: usize, name: &str) {
         let mut dlock = self.data.write().await;
-        if let Some(Some(sync)) = dlock.syncs.get_mut(sync) {
-            if sync.variables.remove(name).is_some() {
-                sync.to_sync.insert(name.to_owned());
-            }
+        if let Some(Some(sync)) = dlock.syncs.get_mut(sync)
+            && sync.variables.remove(name).is_some()
+        {
+            sync.to_sync.insert(name.to_owned());
         }
     }
 
@@ -2807,15 +2796,12 @@ impl CrystalServer {
                                 kind: sync.kind,
                                 variables: sync.variables.clone(),
                             };
-                            if sync.event == SyncEvent::New {
-                                if let Some(player) = data.write().await.players.get_mut(&id) {
-                                    if let Some(Some(sync)) = player.syncs.get_mut(index) {
-                                        if sync.event == SyncEvent::New { // Make sure nothing happened while we were iterating
+                            if sync.event == SyncEvent::New
+                                && let Some(player) = data.write().await.players.get_mut(&id)
+                                    && let Some(Some(sync)) = player.syncs.get_mut(index)
+                                        && sync.event == SyncEvent::New { // Make sure nothing happened while we were iterating
                                             sync.event = SyncEvent::Step;
                                         }
-                                    }
-                                }
-                            }
                             yield iter;
                         }
                     }
@@ -3227,10 +3213,10 @@ impl CrystalServer {
     /// Saves a new value for the requested section & key of the currently open gameini file.
     pub async fn set_globalvari(&self, name: &str, value: Value) {
         let mut dlock = self.data.write().await;
-        if let Some(orgvalue) = dlock.global_variables.get(name) {
-            if value == *orgvalue {
-                return;
-            }
+        if let Some(orgvalue) = dlock.global_variables.get(name)
+            && value == *orgvalue
+        {
+            return;
         }
         dlock.game_save.insert(name.to_owned(), value.clone());
         dlock.update_globalvari.insert(name.to_owned());
