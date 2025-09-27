@@ -150,11 +150,14 @@ impl CrystalServer {
         Self {
             writer: None,
             data: Arc::new(RwLock::new(StreamData {
-                use_webtransport: true,
                 game_id: game_id.to_owned(),
                 ..Default::default()
             })),
         }
+    }
+
+    pub async fn set_webtransport(&mut self, use_wt: bool) {
+        self.data.write().await.use_webtransport = use_wt;
     }
 
     /// Try to establish a connection between the client and the server.
