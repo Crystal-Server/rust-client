@@ -20,7 +20,7 @@ crate-type = ["lib"]
 [features]
 default = []
 __dev = ["dep:tracing", "dep:tracing-subscriber"]
-__local = []
+__local = ["wtransport/dangerous-configuration"]
 
 [dependencies]
 bstr = "1.12.0"
@@ -45,3 +45,4 @@ async-stream = "0.3.6"
 urlencoding = "2.1.3"
 serde = "1.0.226"
 bitflags = "2.9.4"
+wtransport = "0.6.1"

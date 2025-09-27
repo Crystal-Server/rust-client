@@ -1,31 +1,52 @@
-use crate::types::{
-    BdbFilePermissions, BdbPermission, DisconnectionType, ExistsBdbServerUpdate, NewSync,
-    SetBdbFile, WriteBdbServerUpdate,
+use crate::{
+    CallbackDataUpdate, CallbackDisconnected, CallbackLogin, CallbackP2P, CallbackRegister,
+    CallbackRoom,
+    locdata::{
+        data_update::DataUpdate,
+        disconnection_type::DisconnectionType,
+        new_sync::NewSync,
+        new_sync_queue::NewSyncQueue,
+        player_queue::PlayerQueue,
+        sync::{SyncEvent, SyncType},
+        sync_iter::SyncIter,
+    },
+    netdata::{
+        achievement::Achievement,
+        admin_action::AdminAction,
+        administrator::Administrator,
+        bdb::{BdbPermission, SetBdbFile, file_permissions::BdbFilePermissions},
+        callback_server_update::CallbackServerUpdate,
+        change_friend_status::ChangeFriendStatus,
+        client_sync::ClientSync,
+        highscore::Highscore,
+        login::{LoginCode, LoginPassw},
+        optional_variable::OptionalVariable,
+        packets::{read::ReadPacket, write::WritePacket},
+        player::Player,
+        player_request::PlayerRequest,
+        register::RegistrationCode,
+        server_update_callback::{
+            ExistsBdbServerUpdate, FetchBdbServerUpdate, PlayerVariableServerUpdate,
+            ServerUpdateCallback, SyncVariableServerUpdate, WriteBdbServerUpdate,
+        },
+        sync::SelfSync,
+        sync_update::SyncUpdate,
+        variable::Variable,
+        variable_update::VariableUpdate,
+    },
+    stream::{data::StreamData, reader::StreamReader, writer::StreamWriter},
+    unwrap_return,
 };
 
-use super::{
-    buffer::Buffer,
-    leb::Leb,
-    types::{
-        self, Achievement, AdminAction, Administrator, CallbackServerUpdate, ChangeFriendStatus,
-        DataUpdate, FetchBdbServerUpdate, Highscore, LoginCode, LoginPassw, NewSyncQueue,
-        OptionalValue, Player, PlayerQueue, PlayerRequest, PlayerVariableServerUpdate,
-        RegistrationCode, SelfSync, ServerUpdateCallback, SyncEvent, SyncIter, SyncType,
-        SyncUpdate, SyncVariableServerUpdate, Value, VariableUpdate,
-    },
-};
-use bytes::Bytes;
+use super::{buffer::Buffer, leb::Leb};
 use chrono::{DateTime, Utc};
-use futures_util::{
-    SinkExt, Stream, StreamExt,
-    stream::{SplitSink, SplitStream},
-};
-use integer_hasher::{IntMap, IntSet};
+use futures_util::{Stream, StreamExt};
+use integer_hasher::IntSet;
 use machineid_crystal::{Encryption, HWIDComponent, IdBuilder};
 use num_enum::TryFromPrimitive;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    io::{Cursor, Error, ErrorKind, Result as IoResult},
+    io::{Error, ErrorKind, Result as IoResult},
     sync::Arc,
     time::Duration,
 };
@@ -33,14 +54,14 @@ use tokio::{
     net::TcpStream,
     sync::{
         Mutex, RwLock,
-        mpsc::{self, UnboundedSender},
+        mpsc::{self},
     },
-    task::JoinHandle,
     time::{self, Instant},
 };
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 #[cfg(feature = "__dev")]
-use tracing::{info, warn};
+use tracing::info;
+use wtransport::{ClientConfig, Endpoint, RecvStream, SendStream};
 
 /// A "bridge" between a server and the client.
 ///
@@ -82,434 +103,46 @@ pub struct CrystalServer {
     data: Arc<RwLock<StreamData>>,
 }
 
-struct StreamHandler;
-
-struct StreamReader {
-    stream: Option<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
-}
-
-struct StreamWriter {
-    stream: Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,
-}
-
-type CallbackRoom = Box<dyn FnMut() -> String + Sync + Send>;
-type CallbackP2P = Box<dyn FnMut(Option<u64>, i16, Vec<Value>) + Sync + Send>;
-type CallbackRegister = Box<dyn FnMut(RegistrationCode) + Sync + Send>;
-type CallbackLogin = Box<dyn FnMut(LoginCode) + Sync + Send>;
-type CallbackDisconnected = Box<dyn FnMut(DisconnectionType) + Sync + Send>;
-type CallbackDataUpdate = Box<dyn FnMut(DataUpdate) + Sync + Send>;
-
-#[derive(Default)]
-struct StreamData {
-    thread: Option<JoinHandle<()>>,
-    write_mpsc: Option<UnboundedSender<WritePacket>>,
-    last_host: Option<String>,
-
-    is_connected: bool,
-    is_loggedin: bool,
-    is_connecting: bool,
-    is_reconnecting: bool,
-
-    game_id: String,
-    version: f64,
-    session: String,
-    game_token: String,
-    room: String,
-
-    func_room: Option<CallbackRoom>,
-    func_p2p: Option<CallbackP2P>,
-    func_register: Option<CallbackRegister>,
-    func_login: Option<CallbackLogin>,
-    func_disconnected: Option<CallbackDisconnected>,
-    func_data_update: Option<CallbackDataUpdate>,
-
-    player_id: Option<u64>,
-    player_name: Option<String>,
-    player_save: HashMap<String, Value>,
-    player_open_save: String,
-    player_friends: IntSet<u64>,
-    player_incoming_friends: IntSet<u64>,
-    player_outgoing_friends: IntSet<u64>,
-
-    game_save: HashMap<String, Value>,
-    game_open_save: String,
-    game_achievements: IntMap<Leb<u64>, Achievement>,
-    game_highscores: IntMap<Leb<u64>, Highscore>,
-    game_administrators: IntMap<Leb<u64>, Administrator>,
-    game_version: f64,
-
-    global_variables: HashMap<String, Value>,
-
-    players: IntMap<u64, Player>,
-    players_logout: IntSet<u64>,
-    player_queue: IntMap<u64, PlayerQueue>,
-    variables: HashMap<String, Value>,
-    syncs: Vec<Option<SelfSync>>,
-    syncs_remove: Vec<usize>,
-
-    game_master: Option<u64>,
-    session_master: Option<u64>,
-
-    ping: f64,
-    last_ping: Option<Instant>,
-
-    new_sync_queue: Vec<NewSyncQueue>,
-    update_variable: HashSet<String>,
-    update_playerini: HashSet<String>,
-    update_gameini: HashSet<String>,
-    update_globalvari: HashSet<String>,
-    call_disconnected: bool,
-
-    callback_server_update: IntMap<u64, Option<CallbackServerUpdate>>,
-    callback_server_index: u64,
-
-    handshake_completed: bool,
-
-    registered_errors: Vec<ClientError>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-enum ReaderError {
-    StreamError(String),
-    StreamEmpty(String),
-    StreamClosed(String),
-    Unknown(String),
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-enum WriterError {
-    StreamError(String),
-    StreamClosed(String),
-    Unknown(String),
-}
-
 #[allow(dead_code, clippy::enum_variant_names)]
 #[derive(Debug)]
-enum ClientError {
+pub enum ClientError {
     HandlerResult(IoResult<()>),
     HandlerResultString(String),
     HandlerPanic(String),
 }
 
-macro_rules! unwrap_return {
-    ($value: expr, $return: expr) => {
-        if $value.is_err() {
-            return $return;
-        }
-    };
-    ($value: expr) => {
-        if $value.is_err() {
-            return;
-        }
-    };
+pub enum ClientStream {
+    //Tcp(TcpStream),
+    Ws(Box<WebSocketStream<MaybeTlsStream<TcpStream>>>),
+    WebTransport(RecvStream, SendStream),
 }
 
-impl StreamData {
-    pub async fn clear(&mut self, full: bool) {
-        self.is_loggedin = false;
-        self.call_disconnected = true;
-
-        self.player_name.take();
-        self.player_id.take();
-        self.player_save.clear();
-        self.player_open_save.clear();
-        self.player_queue.clear();
-        self.players_logout.clear();
-        self.new_sync_queue.clear();
-        self.update_variable.clear();
-        self.update_playerini.clear();
-        self.update_globalvari.clear();
-        self.callback_server_update.clear();
-        self.callback_server_index = 0;
-        self.players.clear();
-
-        if full {
-            self.is_connecting = false;
-            self.is_connected = false;
-            self.is_reconnecting = false;
-
-            self.game_save.clear();
-            self.game_open_save.clear();
-            self.game_achievements.clear();
-            self.game_highscores.clear();
-            self.game_administrators.clear();
-            self.update_gameini.clear();
-
-            self.last_ping.take();
-            self.handshake_completed = false;
+pub(crate) async fn split_stream(stream: ClientStream) -> (StreamReader, StreamWriter) {
+    match stream {
+        ClientStream::Ws(s) => {
+            let split = (*s).split();
+            (
+                StreamReader {
+                    ws: Some(split.1),
+                    wt: None,
+                },
+                StreamWriter {
+                    ws: Some(split.0),
+                    wt: None,
+                },
+            )
         }
-    }
-}
-
-impl StreamHandler {
-    pub async fn split_stream(
-        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    ) -> (StreamReader, StreamWriter) {
-        let split = stream.split();
-        (
+        ClientStream::WebTransport(reader, writer) => (
             StreamReader {
-                stream: Some(split.1),
+                ws: None,
+                wt: Some(reader),
             },
             StreamWriter {
-                stream: Some(split.0),
+                ws: None,
+                wt: Some(writer),
             },
-        )
+        ),
     }
-}
-
-impl StreamReader {
-    #[inline(always)]
-    pub async fn read(&mut self) -> Result<Buffer, ReaderError> {
-        if let Some(stream) = self.stream.as_mut() {
-            if let Some(Ok(frame)) = stream.next().await {
-                if frame.is_binary() {
-                    let data = frame.into_data();
-                    if !data.is_empty() {
-                        Ok(Buffer::new(Cursor::new(data.to_vec())))
-                    } else {
-                        Err(ReaderError::StreamEmpty(format!(
-                            "tried to read {} byte(s) from ws",
-                            data.len(),
-                        )))
-                    }
-                } else if frame.is_close() {
-                    Err(ReaderError::StreamClosed(String::from(
-                        "ws stream requested to close",
-                    )))
-                } else if frame.is_ping() {
-                    Ok(Buffer::empty())
-                } else {
-                    Err(ReaderError::Unknown(format!(
-                        "obtained an unexpected code for ws: {frame:?}",
-                    )))
-                }
-            } else {
-                Err(ReaderError::StreamClosed(String::from(
-                    "unable to obtain the next ws frame",
-                )))
-            }
-        } else {
-            Err(ReaderError::Unknown(String::from(
-                "no stream open to read from",
-            )))
-        }
-    }
-
-    /*#[inline(always)]
-    pub async fn shutdown(&mut self) {
-        self.stream = None;
-    }*/
-}
-
-impl StreamWriter {
-    #[inline(always)]
-    pub async fn write(&mut self, data: &Buffer) -> Result<(), WriterError> {
-        /*#[cfg(feature = "__dev")]
-        info!("wrote data: {:?}", data.container.get_ref().to_str_lossy());*/
-        if let Some(stream) = self.stream.as_mut() {
-            unwrap_return!(
-                stream
-                    .send(Message::Binary(Bytes::copy_from_slice(
-                        data.container.get_ref()
-                    )))
-                    .await,
-                Err(WriterError::StreamError(format!(
-                    "unable to write {:?} byte(s) to a ws",
-                    data.container.get_ref().len(),
-                )))
-            );
-            unwrap_return!(
-                stream.flush().await,
-                Err(WriterError::StreamError(String::from(
-                    "unable to flush the writer of a ws {:?}",
-                )))
-            );
-            Ok(())
-        } else {
-            Err(WriterError::Unknown(String::from(
-                "no stream open to write to",
-            )))
-        }
-    }
-
-    #[inline(always)]
-    pub async fn write_pong(&mut self) -> IoResult<()> {
-        if let Some(stream) = self.stream.as_mut() {
-            if stream.send(Message::Pong(Bytes::new())).await.is_err() {
-                Err(Error::from(ErrorKind::BrokenPipe))
-            } else {
-                Ok(())
-            }
-        } else {
-            Err(Error::from(ErrorKind::BrokenPipe))
-        }
-    }
-
-    #[inline(always)]
-    pub async fn shutdown(&mut self) {
-        if let Some(mut stream) = self.stream.take() {
-            let _ = stream.close().await;
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum ReadPacket {
-    /// Registration Code
-    Registration(RegistrationCode),
-    /// Login Code
-    Login(LoginCode),
-    /// Login Code
-    LoginBan(LoginCode),
-    /// Player ID, Player Name, Token, Savefile, Friends, Incoming Friends, Outgoing Friends, Game Achievements, Game Master, Session Master, Global Variables
-    LoginOk(
-        u64,
-        String,
-        Option<String>,
-        HashMap<String, Value>,
-        IntSet<Leb<u64>>,
-        IntSet<Leb<u64>>,
-        IntSet<Leb<u64>>,
-        IntMap<Leb<u64>, Achievement>,
-        u64,
-        u64,
-        HashMap<String, Value>,
-    ),
-    /// Player ID, Player Name, Player Variables, Player Syncs, Room
-    PlayerLoggedIn(
-        u64,
-        String,
-        HashMap<String, Value>,
-        Vec<Option<types::Sync>>,
-        String,
-    ),
-    /// Player ID
-    PlayerLoggedOut(u64),
-    /// Game Save, Game Achievements, Game Highscores, Game Administrators, Version
-    SyncGameInfo(
-        HashMap<String, Value>,
-        IntMap<Leb<u64>, Achievement>,
-        IntMap<Leb<u64>, Highscore>,
-        IntMap<Leb<u64>, Administrator>,
-        f64,
-    ),
-    /// Player ID or Server, Message ID, Data
-    P2P(Option<Leb<u64>>, i16, Vec<Value>),
-    /// Player ID, Variables
-    UpdatePlayerVariable(u64, Vec<VariableUpdate>),
-    /// Ping (ms)
-    Ping(Option<f64>),
-    ClearPlayers(),
-    /// Variables
-    GameIniWrite(Vec<VariableUpdate>),
-    /// Player ID, Vec<(Slot, Kind, Type, Variables)>
-    NewSync(u64, Vec<(u64, i16, SyncType, HashMap<String, Value>)>),
-    /// Player ID, Room
-    PlayerChangedRooms(u64, String),
-    /// Player ID, Sync Variables
-    UpdateSync(u64, Vec<SyncUpdate>),
-    /// Player ID, Highscore ID, Score
-    HighscoreUpdate(u64, u64, f64),
-    /// Player ID, Player Syncs, Player Variables
-    UpdatePlayerData(u64, Vec<Option<types::Sync>>, HashMap<String, Value>),
-    /// Callback Index, Variable
-    RequestPlayerVariable(u64, OptionalValue),
-    // Admin Action
-    AdminAction(AdminAction),
-    /// Callback Index, Variable
-    RequestSyncVariable(u64, OptionalValue),
-    /// Game Version
-    ChangeGameVersion(f64),
-    /// Player ID, Administrator
-    ModifyAdministrator(u64, Administrator),
-    /// Administrator ID
-    RemoveAdministrator(u64),
-    ForceDisconnection(),
-    /// Variables
-    PlayerIniWrite(Vec<VariableUpdate>),
-    /// Callback Index, BDB Data, File Permissions
-    RequestBdb(u64, Option<Vec<u8>>, Option<BdbPermission>),
-    /// Change Friend Status, Player ID
-    ChangeFriendStatus(ChangeFriendStatus, u64),
-    Handshake(),
-    /// Message
-    ServerMessage(String),
-    /// Target Host
-    ChangeConnection(String),
-    /// Packets
-    PacketCrunch(Vec<ReadPacket>),
-    /// Callback Index, Exists
-    ExistsBdb(u64, bool),
-    /// Callback Index, Status
-    SetBdb(u64, SetBdbFile),
-    /// Player ID
-    SetGameMaster(u64),
-    /// Player ID
-    SetSessionMaster(u64),
-    /// Name, Value
-    SetGlobalVariable(String, OptionalValue),
-}
-
-#[derive(Debug, Clone)]
-#[doc(hidden)]
-enum WritePacket {
-    /// Hash, Lib Version, Device ID, Game ID, Game Version, Game Session
-    InitializationHandshake([u64; 4], u64, String, String, f64, String),
-    /// Username, Passw/Token, Game Token, Variables, Syncs, Room
-    Login(
-        String,
-        LoginPassw,
-        String,
-        HashMap<String, Value>,
-        Vec<Option<SelfSync>>,
-        String,
-    ),
-    /// Username, Email, Passw, Repeat Passw
-    Register(String, String, String, String),
-    /// Player ID, Callback Index, Variable Name
-    RequestPlayerVariable(PlayerRequest, u64, String),
-    /// Player ID, Message ID, Payload
-    P2P(PlayerRequest, i16, Vec<Value>),
-    /// Game Version
-    UpdateGameVersion(f64),
-    /// Game Session
-    UpdateGameSession(String),
-    /// Variables
-    UpdatePlayerVariable(Vec<VariableUpdate>),
-    Ping(),
-    /// Variables
-    GameIniWrite(Vec<VariableUpdate>),
-    /// Variables
-    PlayerIniWrite(Vec<VariableUpdate>),
-    /// Room
-    UpdateRoom(String),
-    /// Vec<(Slot, Kind, Sync Type, Value)>
-    NewSync(Vec<(u64, i16, SyncType, HashMap<String, Value>)>),
-    /// Sync Update
-    UpdateSync(Vec<SyncUpdate>),
-    /// Achievement ID
-    UpdateAchievement(u64),
-    /// Highscore ID, Score
-    UpdateHighscore(u64, f64),
-    /// Admin Action, Player ID
-    AdminAction(AdminAction, u64),
-    /// Player ID, Callback Index, Sync Slot, Variable Name
-    RequestSyncVariable(u64, u64, u64, String),
-    Logout(),
-    /// BDB Name
-    RequestBdb(u64, String),
-    /// Callback Index, BDB Name, Data, File Permissions
-    SetBdb(u64, String, Vec<u8>, Option<BdbFilePermissions>),
-    /// Change Friend Status, Player ID
-    RequestChangeFriendStatus(ChangeFriendStatus, u64),
-    /// Packets
-    PacketCrunch(Vec<WritePacket>),
-    /// Callback Index, BDB Name
-    ExistsBdb(u64, String),
-    /// Name, Value
-    GlobalVariableWrite(Vec<VariableUpdate>),
 }
 
 impl CrystalServer {
@@ -517,6 +150,7 @@ impl CrystalServer {
         Self {
             writer: None,
             data: Arc::new(RwLock::new(StreamData {
+                use_webtransport: true,
                 game_id: game_id.to_owned(),
                 ..Default::default()
             })),
@@ -527,6 +161,7 @@ impl CrystalServer {
     pub async fn connect(&mut self) {
         #[cfg(feature = "__dev")]
         info!("Connecting to the server");
+        let use_wt;
         {
             #[cfg(feature = "__dev")]
             info!("Fetching stream data");
@@ -540,57 +175,135 @@ impl CrystalServer {
             }
             lock.clear(true).await;
             lock.is_connecting = true;
+            use_wt = lock.use_webtransport;
             #[cfg(feature = "__dev")]
             info!("Stream data OK");
         }
         let url = if let Some(url) = self.data.read().await.last_host.clone() {
             url
+        } else if use_wt {
+            if cfg!(feature = "__local") {
+                String::from("https://127.0.0.1:16557")
+            } else {
+                String::from("https://server.crystal-server.co:16572")
+            }
         } else if cfg!(feature = "__local") {
-            String::from("ws://localhost:16559")
+            String::from("ws://127.0.0.1:16559")
         } else {
             String::from("ws://server.crystal-server.co:16562")
         };
         #[cfg(feature = "__dev")]
-        info!("Connecting to server at {url}");
-        match tokio_tungstenite::connect_async(url).await {
-            Ok((ws, _)) => {
-                #[cfg(feature = "__dev")]
-                info!("Connection OK, initializing");
-                let stream = StreamHandler::split_stream(ws).await;
-                let writer = Arc::new(Mutex::new(stream.1));
-                self.writer = Some(writer.clone());
-                #[cfg(feature = "__dev")]
-                info!("Stream setup OK");
-                let thread =
-                    tokio::spawn(Self::stream_handler(stream.0, writer, self.data.clone()));
+        info!("connecting to {url}, wt:{use_wt}");
+        if use_wt {
+            #[cfg(feature = "__dev")]
+            info!("initializing wt client");
+            let client = match Endpoint::client({
+                #[cfg(feature = "__local")]
                 {
-                    let mut lock = self.data.write().await;
-                    lock.thread = Some(thread);
+                    ClientConfig::builder()
+                        .with_bind_default()
+                        .with_no_cert_validation()
+                        .build()
+                }
+                #[cfg(not(feature = "__local"))]
+                {
+                    ClientConfig::builder()
+                        .with_bind_default()
+                        .with_native_certs()
+                        .build()
+                }
+            }) {
+                Ok(client) => client,
+                Err(_err) => {
                     #[cfg(feature = "__dev")]
-                    info!("Stream data thread OK");
+                    info!("error: {_err:?}");
+                    self.connection_error().await;
+                    return;
+                }
+            };
+            #[cfg(feature = "__dev")]
+            info!("attempting to establish a connection");
+            let conn = match client.connect(url).await {
+                Ok(conn) => conn,
+                Err(_err) => {
+                    #[cfg(feature = "__dev")]
+                    info!("error: {_err:?}");
+                    self.connection_error().await;
+                    return;
+                }
+            };
+            #[cfg(feature = "__dev")]
+            info!("opening a bi-directional stream");
+            let stream = match conn.open_bi().await {
+                Ok(stream) => stream,
+                Err(_err) => {
+                    #[cfg(feature = "__dev")]
+                    info!("error: {_err:?}");
+                    self.connection_error().await;
+                    return;
+                }
+            };
+            #[cfg(feature = "__dev")]
+            info!("waiting for final stream");
+            let stream = match stream.await {
+                Ok(stream) => stream,
+                Err(_err) => {
+                    #[cfg(feature = "__dev")]
+                    info!("error: {_err:?}");
+                    self.connection_error().await;
+                    return;
+                }
+            };
+            self.setup_connection(ClientStream::WebTransport(stream.1, stream.0))
+                .await;
+        } else {
+            match tokio_tungstenite::connect_async(url).await {
+                Ok((ws, _)) => {
+                    self.setup_connection(ClientStream::Ws(Box::new(ws))).await;
+                }
+                Err(_e) => {
+                    #[cfg(feature = "__dev")]
+                    info!("error: {_e:?}");
+                    self.connection_error().await;
                 }
             }
-            Err(_e) => {
-                #[cfg(feature = "__dev")]
-                info!("Connection error: {_e:?}");
-                let mut dlock = self.data.write().await;
-                dlock.clear(true).await;
-                if dlock.call_disconnected {
-                    if let Some(func) = dlock.func_disconnected.as_mut() {
-                        func(DisconnectionType::Disconnected);
-                    }
-                    if let Some(dup) = dlock.func_data_update.as_mut() {
-                        dup(DataUpdate::Disconnected);
-                    }
-                    dlock.call_disconnected = false;
-                }
-                if dlock.last_host.take().is_some() {
-                    drop(dlock);
-                    Box::pin(self.connect()).await;
-                } else {
-                    dlock.is_connecting = false;
-                }
+        }
+    }
+
+    async fn setup_connection(&mut self, cs: ClientStream) {
+        #[cfg(feature = "__dev")]
+        info!("ok, start setup");
+        let stream = split_stream(cs).await;
+        let writer = Arc::new(Mutex::new(stream.1));
+        self.writer = Some(writer.clone());
+        #[cfg(feature = "__dev")]
+        info!("ok, start thread");
+        let thread = tokio::spawn(Self::stream_handler(stream.0, writer, self.data.clone()));
+        {
+            let mut lock = self.data.write().await;
+            lock.thread = Some(thread);
+            #[cfg(feature = "__dev")]
+            info!("ok, finished");
+        }
+    }
+
+    async fn connection_error(&mut self) {
+        let mut dlock = self.data.write().await;
+        dlock.clear(true).await;
+        if dlock.call_disconnected {
+            if let Some(func) = dlock.func_disconnected.as_mut() {
+                func(DisconnectionType::Disconnected);
             }
+            if let Some(dup) = dlock.func_data_update.as_mut() {
+                dup(DataUpdate::Disconnected);
+            }
+            dlock.call_disconnected = false;
+        }
+        if dlock.last_host.take().is_some() {
+            drop(dlock);
+            Box::pin(self.connect()).await;
+        } else {
+            dlock.is_connecting = false;
         }
     }
 
@@ -682,12 +395,7 @@ impl CrystalServer {
                                             };
                                             let dlock = data.read().await;
                                             write_packet!(WritePacket::InitializationHandshake(
-                                                [
-                                                    0x3a0b1a04c51a2811,
-                                                    0x97a18f1dc9ee891d,
-                                                    0xfc7eb64f732a37fd,
-                                                    0xbe65cbabde15c305,
-                                                ],
+                                                [0, 0, 0, 0],
                                                 1,
                                                 hwid,
                                                 dlock.game_id.clone(),
@@ -833,7 +541,7 @@ impl CrystalServer {
                                             Self::iter_missing_data(&mut dlock, pid).await?;
                                             if let Some(player) = dlock.players.get_mut(&pid) {
                                                 for upd in &upds {
-                                                    if let OptionalValue::Some(value) = upd.value.clone() {
+                                                    if let OptionalVariable::Some(value) = upd.value.clone() {
                                                         player
                                                             .variables
                                                             .insert(upd.name.clone(), value.clone());
@@ -891,7 +599,7 @@ impl CrystalServer {
                                                                 info!(
                                                                     "Itering over {vname:?} >>> {value:?}"
                                                                 );
-                                                                if let OptionalValue::Some(value) =
+                                                                if let OptionalVariable::Some(value) =
                                                                     value.clone()
                                                                 {
                                                                     #[cfg(feature = "__dev")]
@@ -988,7 +696,7 @@ impl CrystalServer {
                                         ReadPacket::GameIniWrite(upds) => {
                                             let mut dlock = data.write().await;
                                             for upd in upds {
-                                                if let OptionalValue::Some(value) = upd.value.clone() {
+                                                if let OptionalVariable::Some(value) = upd.value.clone() {
                                                     dlock.game_save.insert(upd.name.clone(), value.clone());
                                                 } else {
                                                     dlock.game_save.remove(&upd.name);
@@ -1039,7 +747,7 @@ impl CrystalServer {
                                                 if let Some(player) = dlock.players.get_mut(&pid) {
                                                     player.syncs.insert(
                                                         slot as usize,
-                                                        Some(types::Sync {
+                                                        Some(ClientSync {
                                                             kind,
                                                             sync_type: stype,
                                                             variables: vari,
@@ -1115,7 +823,7 @@ impl CrystalServer {
                                                 {
                                                     Self::iter_missing_data(&mut dlock, pid).await?;
                                                     if let Some(player) = dlock.players.get_mut(&pid) {
-                                                        if let OptionalValue::Some(value) = vari.clone() {
+                                                        if let OptionalVariable::Some(value) = vari.clone() {
                                                             player
                                                                 .variables
                                                                 .insert(csu.name.clone(), value);
@@ -1180,7 +888,7 @@ impl CrystalServer {
                                                     {
                                                         if let Some(Some(sync)) = player.syncs.get_mut(slot)
                                                         {
-                                                            if let OptionalValue::Some(value) = vari.clone()
+                                                            if let OptionalVariable::Some(value) = vari.clone()
                                                             {
                                                                 sync.variables
                                                                     .insert(csu.name.clone(), value);
@@ -1230,7 +938,7 @@ impl CrystalServer {
                                         ReadPacket::PlayerIniWrite(upds) => {
                                             let mut dlock = data.write().await;
                                             for upd in upds {
-                                                if let OptionalValue::Some(value) = upd.value.clone() {
+                                                if let OptionalVariable::Some(value) = upd.value.clone() {
                                                     dlock.game_save.insert(upd.name.clone(), value.clone());
                                                 } else {
                                                     dlock.game_save.remove(&upd.name);
@@ -1329,13 +1037,71 @@ impl CrystalServer {
                                             let mut dlock = data.write().await;
                                             dlock.is_connecting = true;
                                             dlock.is_reconnecting = true;
+                                            let use_wt = dlock.use_webtransport;
                                             if let Some(dup) = &mut dlock.func_data_update {
                                                 dup(DataUpdate::Reconnecting);
                                             }
-                                            if let Ok((ws, _)) =
+                                            if use_wt {
+                                                #[cfg(feature = "__dev")]
+                                                info!("initializing wt client");
+                                                let client = match Endpoint::client(ClientConfig::default()) {
+                                                    Ok(client) => client,
+                                                    Err(_err) => {
+                                                        #[cfg(feature = "__dev")]
+                                                        info!("error: {_err:?}");
+                                                        return Err(Error::new(
+                                                            ErrorKind::ConnectionRefused,
+                                                            "unable to connect to new host",
+                                                        ));
+                                                    }
+                                                };
+                                                #[cfg(feature = "__dev")]
+                                                info!("attempting to establish a connection");
+                                                let conn = match client.connect(&host).await {
+                                                    Ok(conn) => conn,
+                                                    Err(_err) => {
+                                                        #[cfg(feature = "__dev")]
+                                                        info!("error: {_err:?}");
+                                                        return Err(Error::new(
+                                                            ErrorKind::ConnectionRefused,
+                                                            "unable to connect to new host",
+                                                        ));
+                                                    }
+                                                };
+                                                #[cfg(feature = "__dev")]
+                                                info!("opening a bi-directional stream");
+                                                let stream = match conn.open_bi().await {
+                                                    Ok(stream) => stream,
+                                                    Err(_err) => {
+                                                        #[cfg(feature = "__dev")]
+                                                        info!("error: {_err:?}");
+                                                        return Err(Error::new(
+                                                            ErrorKind::ConnectionRefused,
+                                                            "unable to connect to new host",
+                                                        ));
+                                                    }
+                                                };
+                                                #[cfg(feature = "__dev")]
+                                                info!("waiting for final stream");
+                                                let stream = match stream.await {
+                                                    Ok(stream) => stream,
+                                                    Err(_err) => {
+                                                        #[cfg(feature = "__dev")]
+                                                        info!("error: {_err:?}");
+                                                        return Err(Error::new(
+                                                            ErrorKind::ConnectionRefused,
+                                                            "unable to connect to new host",
+                                                        ));
+                                                    }
+                                                };
+                                                let (sread, swrite) = split_stream(ClientStream::WebTransport(stream.1, stream.0)).await;
+                                                *writer.lock().await = swrite;
+                                                reader = sread;
+                                                dlock.last_host = Some(host);
+                                            } else if let Ok((ws, _)) =
                                                 tokio_tungstenite::connect_async(&host).await
                                             {
-                                                let (sread, swrite) = StreamHandler::split_stream(ws).await;
+                                                let (sread, swrite) = split_stream(ClientStream::Ws(Box::new(ws))).await;
                                                 *writer.lock().await = swrite;
                                                 reader = sread;
                                                 dlock.last_host = Some(host);
@@ -1376,7 +1142,7 @@ impl CrystalServer {
                                         }
                                         ReadPacket::SetGlobalVariable(name, value) => {
                                             let mut dlock = data.write().await;
-                                            if let OptionalValue::Some(value) = value {
+                                            if let OptionalVariable::Some(value) = value {
                                                 dlock.global_variables.insert(name, value);
                                             } else {
                                                 dlock.global_variables.remove(&name);
@@ -1487,7 +1253,7 @@ impl CrystalServer {
                 b.write_string(name)?;
                 b.write_leb_u64(*index)?;
             }
-            WritePacket::P2P(player_request, mid, payload) => {
+            WritePacket::P2P(mid, player_request, payload) => {
                 b.write_u8(4)?;
                 b.write(player_request)?;
                 b.write_i16(*mid)?;
@@ -1836,7 +1602,7 @@ impl CrystalServer {
             && let Some(player) = data.players.get_mut(&pid)
         {
             for (name, value) in pq.variables.drain() {
-                if let OptionalValue::Some(value) = value {
+                if let OptionalVariable::Some(value) = value {
                     player.variables.insert(name, value);
                 } else {
                     player.variables.remove(&name);
@@ -1850,7 +1616,7 @@ impl CrystalServer {
                         .enumerate()
                         .find(|(_, sn)| sn.slot == index)
                 {
-                    *osync = Some(types::Sync {
+                    *osync = Some(ClientSync {
                         event: SyncEvent::New,
                         kind: sn.kind,
                         sync_type: sn.sync_type,
@@ -1870,7 +1636,7 @@ impl CrystalServer {
                     }
                     if let Some(is) = pq.syncs.remove(&index) {
                         for (name, value) in is {
-                            if let OptionalValue::Some(value) = value {
+                            if let OptionalVariable::Some(value) = value {
                                 sync.variables.insert(name, value);
                             } else {
                                 sync.variables.remove(&name);
@@ -2271,7 +2037,7 @@ impl CrystalServer {
     }
 
     /// Sets a variable with the name and value provided.
-    pub async fn set_variable(&self, name: &str, value: Value) {
+    pub async fn set_variable(&self, name: &str, value: Variable) {
         let mut dlock = self.data.write().await;
         if let Some(orgvalue) = dlock.variables.get(name)
             && value == *orgvalue
@@ -2376,8 +2142,8 @@ impl CrystalServer {
     /// Sends a message "peer-to-peer" to the requested target.
     /// The Message ID will allow you to quickly differentiate what message it's
     /// supposed to be.
-    pub async fn p2p(&self, target: PlayerRequest, message_id: i16, payload: Vec<Value>) {
-        self.internal_iosend(WritePacket::P2P(target, message_id, payload))
+    pub async fn p2p(&self, message_id: i16, target: PlayerRequest, payload: Vec<Variable>) {
+        self.internal_iosend(WritePacket::P2P(message_id, target, payload))
             .await
     }
 
@@ -2453,7 +2219,7 @@ impl CrystalServer {
 
     /// Returns the saved value in the section & key of the currently open playerini file.
     /// If the value is not found, it returns [None].
-    pub async fn get_playerini(&self, section: &str, key: &str) -> Option<Value> {
+    pub async fn get_playerini(&self, section: &str, key: &str) -> Option<Variable> {
         let dlock = self.data.read().await;
         dlock
             .player_save
@@ -2462,7 +2228,7 @@ impl CrystalServer {
     }
 
     /// Saves a new value for the requested section & key of the currently open playerini file.
-    pub async fn set_playerini(&self, section: &str, key: &str, value: Value) {
+    pub async fn set_playerini(&self, section: &str, key: &str, value: Variable) {
         let mut dlock = self.data.write().await;
         let save_key = Self::get_save_key(&dlock.player_open_save, section, key);
         if let Some(orgvalue) = dlock.player_save.get(&save_key)
@@ -2509,7 +2275,7 @@ impl CrystalServer {
 
     /// Returns the saved value in the section & key of the currently open gameini file.
     /// If the value is not found, it returns [None].
-    pub async fn get_gameini(&self, section: &str, key: &str) -> Option<Value> {
+    pub async fn get_gameini(&self, section: &str, key: &str) -> Option<Variable> {
         let dlock = self.data.read().await;
         dlock
             .game_save
@@ -2518,7 +2284,7 @@ impl CrystalServer {
     }
 
     /// Saves a new value for the requested section & key of the currently open gameini file.
-    pub async fn set_gameini(&self, section: &str, key: &str, value: Value) {
+    pub async fn set_gameini(&self, section: &str, key: &str, value: Variable) {
         let mut dlock = self.data.write().await;
         let save_key = Self::get_save_key(&dlock.game_open_save, section, key);
         if let Some(orgvalue) = dlock.game_save.get(&save_key)
@@ -2714,7 +2480,7 @@ impl CrystalServer {
     }
 
     /// Set a sync variable with the specified name and value.
-    pub async fn set_variable_sync(&self, sync: usize, name: &str, value: Value) {
+    pub async fn set_variable_sync(&self, sync: usize, name: &str, value: Variable) {
         let mut dlock = self.data.write().await;
         if let Some(Some(sync)) = dlock.syncs.get_mut(sync) {
             if let Some(orgvalue) = sync.variables.get(name)
@@ -2743,7 +2509,7 @@ impl CrystalServer {
         pid: u64,
         sync: usize,
         name: &str,
-    ) -> Option<Value> {
+    ) -> Option<Variable> {
         let dlock = self.data.read().await;
         if let Some(player) = dlock.players.get(&pid) {
             if let Some(Some(sync)) = player.syncs.get(sync) {
@@ -3205,13 +2971,13 @@ impl CrystalServer {
 
     /// Returns the saved value in the section & key of the currently open gameini file.
     /// If the value is not found, it returns [None].
-    pub async fn get_globalvari(&self, name: &str) -> Option<Value> {
+    pub async fn get_globalvari(&self, name: &str) -> Option<Variable> {
         let dlock = self.data.read().await;
         dlock.game_save.get(name).cloned()
     }
 
     /// Saves a new value for the requested section & key of the currently open gameini file.
-    pub async fn set_globalvari(&self, name: &str, value: Value) {
+    pub async fn set_globalvari(&self, name: &str, value: Variable) {
         let mut dlock = self.data.write().await;
         if let Some(orgvalue) = dlock.global_variables.get(name)
             && value == *orgvalue

@@ -37,7 +37,9 @@ impl LebCodec {
         loop {
             if pos >= data.len() {
                 #[cfg(feature = "__dev")]
-                warn!("Unexpected data end for LEB128 decoder: The number may be truncated or incorrect.");
+                warn!(
+                    "Unexpected data end for LEB128 decoder: The number may be truncated or incorrect."
+                );
                 break;
             }
             num |= ((data[pos] as u64) & 0x7f).wrapping_shl(shift);

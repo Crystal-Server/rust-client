@@ -1,9 +1,37 @@
+use crate::{
+    locdata::{data_update::DataUpdate, disconnection_type::DisconnectionType},
+    netdata::{login::LoginCode, register::RegistrationCode, variable::Variable},
+};
+
 mod buffer;
 pub mod client;
 mod leb;
-pub mod types;
+pub mod locdata;
+pub mod netdata;
+pub(crate) mod stream;
 
-/// This macro provides a natural way to make a [types::Value] while making it readable.
+pub type CallbackRoom = Box<dyn FnMut() -> String + Sync + Send>;
+pub type CallbackP2P = Box<dyn FnMut(Option<u64>, i16, Vec<Variable>) + Sync + Send>;
+pub type CallbackRegister = Box<dyn FnMut(RegistrationCode) + Sync + Send>;
+pub type CallbackLogin = Box<dyn FnMut(LoginCode) + Sync + Send>;
+pub type CallbackDisconnected = Box<dyn FnMut(DisconnectionType) + Sync + Send>;
+pub type CallbackDataUpdate = Box<dyn FnMut(DataUpdate) + Sync + Send>;
+
+#[macro_export]
+macro_rules! unwrap_return {
+    ($value: expr, $return: expr) => {
+        if $value.is_err() {
+            return $return;
+        }
+    };
+    ($value: expr) => {
+        if $value.is_err() {
+            return;
+        }
+    };
+}
+
+/// This macro provides a natural way to make a [netdata::variable::Variable] while making it readable.
 ///
 /// Small sized structures such as [i32] will be converted to their bigger supported structure sizes, [i64].
 /// For integers the type used is [i64]
@@ -21,7 +49,7 @@ pub mod types;
 /// }, b"scary binary data!"]);
 /// ```
 #[macro_export]
-macro_rules! value {
+macro_rules! variable {
     // Taken from serde_json's `json_internal` macro but using Crystal Server's data types instead.
 
     //////////////////////////////////////////////////////////////////////////

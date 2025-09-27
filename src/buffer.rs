@@ -9,7 +9,7 @@ use std::{
 use super::leb::{Leb, LebCodec};
 
 #[derive(Default, Clone, Debug)]
-pub struct Buffer {
+pub(crate) struct Buffer {
     pub container: Cursor<Vec<u8>>,
 }
 
